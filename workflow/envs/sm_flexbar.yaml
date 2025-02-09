@@ -1,0 +1,9 @@
+name: sm_flexbar
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - flexbar
+  

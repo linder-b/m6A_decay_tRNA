@@ -1,0 +1,27 @@
+#!/bin/bash
+
+p=
+tmpfolder=
+
+while [[ $1 == -* ]]
+do
+   case $1 in
+       -h)  printf "bams2cit [-p] [-t tmpfolder] xyz.bamlist\n\n -p\tShow progress\n\n"
+		exit
+		;;
+       -p) p=" -p";;
+       -n) exit 10;;
+       -t) shift;
+	   tmpfolder=" -Djava.io.tmpdir=$1"
+	   mkdir -p $1
+	   ;;
+       -*) add="$add $1";; 
+   esac
+   shift;
+done
+
+
+gedi $tmpfolder$add -e Bam2CIT $p $1.cit $( grep -v "^#" $1 )
+gedi $tmpfolder$add -e CorrectCIT $p $1.cit
+gedi $tmpfolder$add -e ReadCount $p $1.cit
+

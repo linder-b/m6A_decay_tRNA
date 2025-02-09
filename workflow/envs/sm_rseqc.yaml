@@ -1,0 +1,9 @@
+name: sm_rseqc
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - rseqc
+  - bedparse

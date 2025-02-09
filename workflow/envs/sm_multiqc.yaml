@@ -1,0 +1,9 @@
+name: sm_multiqc
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - multiqc
+  

@@ -1,0 +1,263 @@
+# --- general info --- #
+contact:
+  email: linder@embl.de
+  person: Bastian Linder
+local:
+  fastq_dir: /tmpdata/linder/fastq
+  tmp_dir: /tmpdata/linder
+  results_dir: results
+  logs_dir: logs
+  genome_dir: /g/steinmetz/linder/genomes
+  memory: 4g
+# --- genomes --- #
+genomes:
+  mus_musculus:
+    build: GRCm38
+    release: M25
+    fasta_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/GRCm38.p6.genome.fa.gz
+    gtf_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.annotation.gtf.gz
+    tx_fasta_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.transcripts.fa.gz
+  homo_sapiens:
+    build: GRCh38
+    release: v35
+    fasta_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_35/GRCh38.primary_assembly.genome.fa.gz
+    gtf_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_35/gencode.v35.annotation.gtf.gz
+    tx_fasta_url: ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_35/gencode.v35.transcripts.fa.gz
+  saccharomyces_cerevisiae:
+    build: R64-1-1
+    release: "110"
+    fasta_url: https://ftp.ensembl.org/pub/release-110/fasta/saccharomyces_cerevisiae/dna/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa.gz
+    gtf_url: https://ftp.ensembl.org/pub/release-110/gtf/saccharomyces_cerevisiae/Saccharomyces_cerevisiae.R64-1-1.110.gtf.gz
+    tx_fasta_url: https://ftp.ensembl.org/pub/release-110/fasta/saccharomyces_cerevisiae/cdna/Saccharomyces_cerevisiae.R64-1-1.cdna.all.fa.gz
+  spikein:
+    ERCC92:
+      url: https://assets.thermofisher.com/TFS-Assets/LSG/manuals/ERCC92.zip
+# --- default parameters --- #
+sample_table: samples.tsv
+defaults:
+  flexbar:
+    --adapters workflow/resources/flexbar/adapters_iCLIP.fasta
+    --adapters2 workflow/resources/flexbar/adapters_iCLIP.fasta
+    --qtrim TAIL
+    --qtrim-format sanger
+    --qtrim-threshold 30
+    --qtrim-post-removal
+    --adapter-trim-end RIGHT
+    --max-uncalled 1
+    --length-dist
+    --single-reads-paired
+  STAR:
+    --alignSJoverhangMin 999
+    --outSJfilterOverhangMin -1 -1 -1 -1
+    --outSJfilterReads Unique
+    --outFilterScoreMinOverLread 0
+    --outFilterMatchNminOverLread 0.3
+    --outFilterMismatchNoverReadLmax 0.1
+    --outFilterMismatchNmax 3
+    --outFilterMultimapNmax 1
+    --outSAMmapqUnique 60
+    --outSAMattributes NH HI AS NM MD
+    --outSAMtype BAM SortedByCoordinate
+  umitools_extract:
+    --bc-pattern=NNNXXXXNN
+  umitools_dedup:
+    --extract-umi-method read_id
+    --method unique
+    --paired
+# --- experiment-specific parameters --- #
+experiments:
+  hek293_m6aseq:
+    gse: GSE55572
+  mcm5s2U_slam:
+    STAR:
+      --alignSJoverhangMin 999
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  B116:
+    flexbar:
+      --adapters workflow/resources/flexbar/adapters_iCLIP.fasta
+      --adapters2 workflow/resources/flexbar/adapters_iCLIP.fasta
+      --qtrim TAIL
+      --qtrim-format sanger
+      --qtrim-threshold 30
+      --qtrim-post-removal
+      --adapter-trim-end RIGHT
+      --adapter-error-rate 0.1
+      --adapter-min-overlap 1
+      --adapter-pair-overlap ON
+      --adapter-min-poverlap 20
+      --adapter-revcomp ON
+      --adapter-cycles 2
+      --htrim-right ACGT
+      --htrim-min-length 4
+      --htrim-error-rate 0.25
+      --min-read-length 12
+      --max-uncalled 1
+      --length-dist
+      --single-reads-paired
+    STAR:
+      --seedSearchStartLmax 20
+      --alignSJoverhangMin 999
+      --alignEndsType EndToEnd
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterScoreMinOverLread 0
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  Mauer_et_al:
+    flexbar:
+      --min-read-length 12
+      --adapters workflow/resources/flexbar/adapters_iCLIP.fasta
+      --adapters2 workflow/resources/flexbar/adapters_iCLIP.fasta
+      --qtrim TAIL
+      --qtrim-format sanger
+      --qtrim-threshold 30
+      --qtrim-post-removal
+      --adapter-trim-end RIGHT
+      --adapter-error-rate 0.1
+      --adapter-min-overlap 1
+      --adapter-pair-overlap ON
+      --adapter-min-poverlap 20
+      --adapter-revcomp ON
+      --adapter-cycles 2
+      --htrim-right ACGT
+      --htrim-min-length 4
+      --htrim-error-rate 0.25
+      --max-uncalled 1
+      --length-dist
+      --single-reads-paired
+    STAR:
+      --seedSearchStartLmax 20
+      --alignSJoverhangMin 999
+      --alignEndsType EndToEnd
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterScoreMinOverLread 0
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  NatMeth:
+    flexbar:
+      --min-read-length 12
+      --adapters workflow/resources/flexbar/adapters_iCLIP.fasta
+      --adapters2 workflow/resources/flexbar/adapters_iCLIP.fasta
+      --qtrim TAIL
+      --qtrim-format sanger
+      --qtrim-threshold 30
+      --qtrim-post-removal
+      --adapter-trim-end RIGHT
+      --adapter-error-rate 0.1
+      --adapter-min-overlap 1
+      --adapter-pair-overlap ON
+      --adapter-min-poverlap 20
+      --adapter-revcomp ON
+      --adapter-cycles 2
+      --htrim-right ACGT
+      --htrim-min-length 4
+      --htrim-error-rate 0.25
+      --max-uncalled 1
+      --length-dist
+      --single-reads-paired
+    STAR:
+      --seedSearchStartLmax 20
+      --alignSJoverhangMin 999
+      --alignEndsType EndToEnd
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterScoreMinOverLread 0
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  wang_2013_ythdf2_decay:
+    flexbar:
+      --adapter-preset SmallRNA
+      --qtrim TAIL
+      --qtrim-format sanger
+      --qtrim-threshold 30
+      --qtrim-post-removal
+      --adapter-trim-end RIGHT
+      --max-uncalled 1
+      --length-dist
+      --single-reads-paired
+    STAR:
+      --alignSJoverhangMin 999
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  han_2020_disomes:
+    flexbar:
+      --max-uncalled 0
+      --length-dist
+    STAR:
+      --alignSJoverhangMin 999
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+  mazor_2018_met_starv:
+    flexbar:
+      --adapter-seq CTGTAGGCACCATCAAT
+      --max-uncalled 1
+      --htrim-right ACGT
+      --htrim-min-length 3
+      --htrim-error-rate 0.25
+      --min-read-length 12
+      --length-dist
+  loayza_2013_nutlin:
+    flexbar:
+      --adapter-seq TCGTATGCCGTCTTCTGCTTG
+      --max-uncalled 1
+      --htrim-right ACGT
+      --htrim-min-length 3
+      --htrim-error-rate 0.25
+      --min-read-length 12
+      --length-dist
+  zou_2019_cancer_riboseq:
+    flexbar:
+      --adapter-seq CTGTAGGCACCATCAAT
+      --max-uncalled 1
+      --htrim-right ACGT
+      --htrim-min-length 3
+      --htrim-error-rate 0.25
+      --min-read-length 12
+      --length-dist
+  ingolia_2011_runoff:
+    flexbar:
+      --adapter-seq CTGTAGGCACCATCAATTCGTATGCCGTCTTCTGCTTGAA
+      --max-uncalled 1
+      --htrim-right ACGT
+      --htrim-min-length 3
+      --htrim-error-rate 0.25
+      --min-read-length 12
+      --length-dist

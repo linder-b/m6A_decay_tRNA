@@ -1,0 +1,10 @@
+name: sm_subread
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - subread
+  - samtools
+  - python 

@@ -1,0 +1,8 @@
+name: sm_picard
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - picard

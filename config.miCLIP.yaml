@@ -1,0 +1,38 @@
+experiments:
+  miCLIP:
+    flexbar:
+      --min-read-length 12
+      --adapters workflow/resources/flexbar/adapters_iCLIP.fasta
+      --adapters2 workflow/resources/flexbar/adapters_iCLIP.fasta
+      --qtrim TAIL
+      --qtrim-format sanger
+      --qtrim-threshold 30
+      --qtrim-post-removal
+      --adapter-trim-end RIGHT
+      --adapter-error-rate 0.1
+      --adapter-min-overlap 1
+      --adapter-pair-overlap ON
+      --adapter-min-poverlap 20
+      --adapter-revcomp ON
+      --adapter-cycles 2
+      --htrim-right ACGT
+      --htrim-min-length 4
+      --htrim-error-rate 0.25
+      --max-uncalled 1
+      --length-dist
+      --single-reads-paired
+    STAR:
+      --seedSearchStartLmax 20
+      --alignSJoverhangMin 999
+      --alignEndsType EndToEnd
+      --outSJfilterOverhangMin -1 -1 -1 -1
+      --outSJfilterReads Unique
+      --outFilterScoreMinOverLread 0
+      --outFilterMatchNminOverLread 0.3
+      --outFilterMismatchNoverReadLmax 0.1
+      --outFilterMismatchNmax 3
+      --outFilterMultimapNmax 1
+      --outSAMmapqUnique 60
+      --outSAMattributes NH HI AS NM MD
+      --outSAMtype BAM SortedByCoordinate
+        

@@ -1,0 +1,15 @@
+name: sm_preprocess
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - dropseq_tools
+  - fastqc
+  - picard
+  - samtools
+  - bedtools
+  - sra-tools
+  - star
+  

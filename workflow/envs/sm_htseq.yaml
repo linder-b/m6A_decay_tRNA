@@ -1,0 +1,8 @@
+name: sm_htseq
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - htseq
