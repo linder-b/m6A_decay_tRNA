@@ -1,0 +1,168 @@
+import re
+
+configfile: "input.yaml"
+DATA_DIR=config["data_dir"]
+DATA_TYPE=config["data_type"]
+ADAPTER=config["adapter_seq"]
+BC5=config["5_barcode"]
+BC3=config["3_barcode"]
+STAR_PARAMS=config["STAR_params"]
+STAR_INDEX=config["STAR_index"]
+CDS_INDEX=config["CDS_index"]
+CDS_FILE=config["CDS_file"]
+EXCLUDE_CODONS=config["exclude_codons"]
+EXTEND_NT=config["extend_nt"]
+
+CDS_name = re.sub('.*/',"",CDS_INDEX)
+(SAMPLES,)= glob_wildcards(DATA_DIR + "/{sample}.fastq")
+
+
+
+rule all:
+  input:
+   #f"Assign_Asite/{CDS_name}_codon_excluded.txt",
+   expand("Assign_Asite/{sample}_Asite_count_coverage.txt",sample=SAMPLES)
+   
+ 
+
+rule clip_adapter:
+  input:
+    DATA_DIR + "/{sample}.fastq"
+  threads: 10
+  params:
+    ADAPTER
+  output:
+    fastq_cl="data_cl/{sample}_cl.fastq",
+    cl_report="data_cl/{sample}_cl_report.txt"
+  shell:
+    "cutadapt -j {threads} -m 10 -a {params}  {input} > {output.fastq_cl} 2>> {output.cl_report}"
+
+
+rule trim_bc: 
+    input: 
+      "data_cl/{sample}.fastq"
+    threads:10
+    params:
+      bc5=BC5,
+      bc3=BC3
+    output:
+      fastq_tr="data_tr/{sample}_tr.fastq",
+      tr_report="data_tr/{sample}_tr_report.txt"
+    shell:
+      "cutadapt -j {threads} -m 10 -u {params.bc5} -u -{params.bc3} -o {output.fastq_tr} {input} 1>> {output.tr_report}"
+
+
+rule rm_ncRNA:
+    input:
+      "data_tr/{sample}_cl_tr.fastq"
+    threads:16
+    log: 
+      report="rm_ncRNA/{sample}_rmncRNA_report.txt"
+    output:
+      fastq="rm_ncRNA/{sample}_Unmapped.out.fastq"
+    shell:
+        " STAR --runThreadN {threads} --genomeDir {STAR_INDEX}  --readFilesIn {input} {STAR_PARAMS}  --outFileNamePrefix rm_ncRNA/{wildcards.sample}_ 1>> {log} && "
+        "mv rm_ncRNA/{wildcards.sample}_Unmapped.out.mate1 {output.fastq}" 
+
+
+
+rule mapping:
+    input:
+      "rm_ncRNA/{sample}_Unmapped.out.fastq"
+    params:
+      outdir="mapping",
+      
+    log:
+      report="mapping/{sample}_mapping_report.txt"
+    output:
+      frame="mapping/{sample}_Unmapped.out_frame.txt"
+    shell:
+      '''
+      if [[ "{DATA_TYPE}" == "monosome" ]]; then
+          
+          scripts/rp_analysis.sh -M Mapping -Q {input}  -T {CDS_INDEX}  -O {params.outdir}  -X 35 -I 25 -E {EXTEND_NT} -f {output.frame} 1>> {log}
+      
+      elif [[ "{DATA_TYPE}" == "disome" ]]; then
+
+          scripts/rp_analysis_disome.sh -M Mapping -Q {input}  -T {CDS_INDEX} -A {CDS_FILE} -O {params.outdir}  -X 70 -I 45 -E {EXTEND_NT} -f {output.frame} 1>> {log}
+      
+      fi
+      '''
+
+#rule cp_offset:
+#      input:
+#        offset_file
+#      output:
+#        "/scratch/users/jiewu23/snakemake_bastian/outputs/length_offset_test_3.txt"
+#      shell:
+#        "cp {input} {output}"
+
+
+rule offset_generation:
+    input:
+      "mapping/{sample}_Unmapped.out_frame.txt"
+    output:
+      "mapping/{sample}_offset.txt"
+    shell:
+      '''
+      if [[ {DATA_TYPE} == "monosome" ]]; then
+
+          scripts/offset_generation.sh {input} {output} {EXTEND_NT}
+      
+      elif [[ {DATA_TYPE} == "disome" ]]; then
+
+          scripts/offset_generation_disome.sh {input} {output} {EXTEND_NT}
+
+      fi
+      '''
+
+rule codon_generation:
+    input:
+      CDS_FILE
+    output:
+      "Assign_Asite/{CDS_name}_codon_excluded.txt"
+    priority: 100
+    shell:
+      "scripts/codon_file_generate.sh {input} {output} {EXTEND_NT} {EXCLUDE_CODONS}"
+
+rule assign_Asite:
+    input:
+      offset_file="mapping/{sample}_offset.txt"
+    params:
+      outdir="Assign_Asite"
+    log:
+      report="Assign_Asite/{sample}_Assign_report.txt"
+    output:    
+      Asite_count="Assign_Asite/{sample}_Unmapped.out_codon_Asite_count.txt"
+    shell:
+      '''
+      if [[ "{DATA_TYPE}" == "monosome" ]]; then
+        
+        scripts/rp_analysis.sh  -M WavePlot  -A {CDS_FILE}   -D {input.offset_file}  -O {params.outdir}  -E {EXTEND_NT} -F {EXCLUDE_CODONS} -B {EXCLUDE_CODONS} -a {output.Asite_count} 1>> {log}
+      
+      elif [[ {DATA_TYPE} == "disome" ]];then
+
+         scripts/rp_analysis_disome.sh  -M WavePlot  -A {CDS_FILE}   -D {input.offset_file}  -O {params.outdir}  -E {EXTEND_NT} -F {EXCLUDE_CODONS} -B {EXCLUDE_CODONS} -a {output.Asite_count} 1>> {log}
+      
+      fi
+      '''
+
+
+
+rule coverage_generation:
+    input:
+      Asite_count="Assign_Asite/{sample}_Unmapped.out_codon_Asite_count.txt",
+      codon_file = "Assign_Asite/" + CDS_name + "_codon_excluded.txt"
+    log:
+      report_cov="Assign_Asite/{sample}_Asite_count_coverage.log", 
+      report_RPMcov="Assign_Asite/{sample}_Asite_count_RPMcoverage.log"
+    output:
+      RPM_cov="Assign_Asite/{sample}_Asite_count_RPMcoverage.txt",
+      cov="Assign_Asite/{sample}_Asite_count_coverage.txt"
+    shell:
+      "scripts/coverage.sh {input.Asite_count} {input.codon_file} {output.cov} 1>> {log.report_cov} && " 
+      "scripts/RPM_coverage.sh {input.Asite_count} {input.codon_file} {output.RPM_cov} 1>> {log.report_RPMcov}"
+
+
+
+#Assign_Asite/{params}_codon_excluded.txt

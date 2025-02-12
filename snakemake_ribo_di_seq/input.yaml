@@ -1,0 +1,13 @@
+data_dir: data
+data_type: monosome # data type is "monosome" or "disome"
+adapter_seq: CTGTAGGCACCATCAATAGATCGGAAGA
+5_barcode: 0
+3_barcode: 4
+STAR_params: --outFilterMultimapNmax 20 --outSAMmultNmax 1 --outFilterMismatchNoverReadLmax 0.05  --alignEndsType EndToEnd  --outReadsUnmapped Fastx --outSAMtype BAM Unsorted
+STAR_index: /home/jwu/annotation/Saccharomyces_cerevisiae.R64-1-1.86_changed_non_protein_coding_tRNACCA_STAR
+CDS_index: /home/jwu/annotation/extend_transcriptome/Saccharomyces_cerevisiae.R64-1-1.86_changed_CDS_non_overlappwithohters_protein_coding_extended_annotated_nooverlapwithTy
+CDS_file: /home/jwu/annotation/extend_transcriptome/Saccharomyces_cerevisiae.R64-1-1.86_changed_CDS_non_overlappwithohters_protein_coding_extended_annotated_nooverlapwithTy.fa
+exclude_codons: 0
+extend_nt: 21
+
+
