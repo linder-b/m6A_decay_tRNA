@@ -7,7 +7,7 @@ conda activate snakemake_ribo
 # adds execute permissions to scripts
 chmod +x scripts/*
 
-# prepare STAT and bowtie index
+# prepare STAR and bowtie index
 # set up parameters in input.yaml 
 
 # run snakemake pipeline
