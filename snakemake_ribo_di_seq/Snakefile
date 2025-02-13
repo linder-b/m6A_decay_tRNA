@@ -155,9 +155,9 @@ rule coverage_generation:
       codon_file = "Assign_Asite/" + CDS_name + "_codon_excluded.txt"
     log:
       report_cov="Assign_Asite/{sample}_Asite_count_coverage.log", 
-      report_RPMcov="Assign_Asite/{sample}_Asite_count_RPMcoverage.log"
+      report_RPMcov="Assign_Asite/{sample}_Asite_count_RPM_coverage.log"
     output:
-      RPM_cov="Assign_Asite/{sample}_Asite_count_RPMcoverage.txt",
+      RPM_cov="Assign_Asite/{sample}_Asite_count_RPM_coverage.txt",
       cov="Assign_Asite/{sample}_Asite_count_coverage.txt"
     shell:
       "scripts/coverage.sh {input.Asite_count} {input.codon_file} {output.cov} 1>> {log.report_cov} && " 
