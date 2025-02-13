@@ -9,11 +9,11 @@ adapter_seq: CTGTAGGCACCATCAATAGATCGGAAGA
 # parameters for runing STAR mapping
 STAR_params: --outFilterMultimapNmax 20 --outSAMmultNmax 1 --outFilterMismatchNoverReadLmax 0.05  --alignEndsType EndToEnd  --outReadsUnmapped Fastx --outSAMtype BAM Unsorted
 # Index for STAR mapping
-STAR_index: /home/jwu/annotation/human/hg38/STAR_hg38_ncRNA_index
+STAR_index: /human/hg38/STAR_hg38_ncRNA_index
 # bowtie indext prefix for CDS. 
-CDS_index: /home/jwu/annotation/human/hg38/hg38_canonical_chrSelected_singleline
+CDS_index: /human/hg38/hg38_canonical_chrSelected_singleline
 # CDS fasta file with sequence in one line
-CDS_file: /home/jwu/annotation/human/hg38/hg38_canonical_chrSelected_singleline.fa
+CDS_file: /human/hg38/hg38_canonical_chrSelected_singleline.fa
 # numbers of codon excluded at the 5' and 3' end of reads for analysis
 exclude_codons: 0
 # numbers of nucleotides extended at the 5' and 3' end of CDS.
