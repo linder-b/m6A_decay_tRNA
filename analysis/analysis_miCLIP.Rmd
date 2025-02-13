@@ -1,0 +1,984 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Integrated analysis of multiple miCLIP experiments.
+Requires the "prerequisites" objects of the the "analysis_human.qmd" notebook.
+
+# Data
+
+## Pileup BAMs
+
+```{r bamList}
+
+bamList = list.files(paste0("../results/",c("B116", "DRB", "NatMeth"),"/star/homo_sapiens_GRCh38_v35_nospike"), ".Aligned.sortedByCoord.out.dedup.bam$", full.names = TRUE)
+names(bamList) = gsub(".Aligned.sortedByCoord.out.dedup.bam", "", basename(bamList))
+
+names(bamList)
+
+```
+
+```{r pileup parameters}
+require("Rsamtools")
+require("data.table")
+
+## choose read start position bins that are available for downstream position-dependent filtering 
+#query_bins = c(0,1,2,3,4, Inf)
+query_bins = c(1:100, Inf)
+
+
+puparam <-
+  PileupParam(
+    max_depth = 1000000,
+    min_base_quality = 24,
+    min_mapq = 60,
+    min_nucleotide_depth = 2,
+    min_minor_allele_depth = 1, # return only positions that have at least one mismatch
+    distinguish_strands = TRUE,
+    distinguish_nucleotides = TRUE,
+    ignore_query_Ns = TRUE,
+    include_deletions = TRUE,
+    include_insertions = TRUE,
+    left_bins = NULL,
+    query_bins = query_bins, # bin by position in read to allow filtering later
+    cycle_bins = NULL
+  )
+
+bamparam <-
+  ScanBamParam(flag = scanBamFlag(isSecondaryAlignment = FALSE,
+                                  isDuplicate = FALSE))
+
+levels(cut(1:100, query_bins))
+
+```
+
+```{r pileup function}
+
+get_pileups <-
+  function(bamFile = NULL,
+           bamparam = NULL,
+           puparam = NULL,
+           bsg = NULL,
+           tmpDir = NULL, 
+           recalc = FALSE) {
+    puFile = file.path(tmpDir,
+                       paste0(basename(bamFile), ".pileup", digest::digest(c(bamparam, puparam)), ".tsv"))
+    
+    if (!file.exists(puFile) | recalc) {
+      pu <-
+        as.data.table(pileup(
+          file = bamFile,
+          scanBamParam = bamparam,
+          pileupParam = puparam
+        ))
+      
+      ## correct nucleotide for strandedness
+      # pu[strand == "-", nucleotide := chartr("AGCT", "TCGA", nucleotide)]
+      pu[, nuc_corr := ifelse(strand == "-",
+                              chartr("AGCT", "TCGA", as.character(nucleotide)),
+                              as.character(nucleotide))]
+      ## rename insertions and deletions
+      pu[nucleotide == "+", nuc_corr := "ins"]
+      pu[nucleotide == "-", nuc_corr := "del"]
+      
+      pu[, nuc_corr := factor(nuc_corr, levels =  c("A", "C", "G", "T", "del", "ins"))]
+      
+      ## get reference nucleotide
+      pu[seqnames %in% seqlevels(bsg) , ref := {
+        gr = GRanges(
+          seqnames = seqnames,
+          ranges = IRanges(start = pos, width = 1),
+          strand =  strand
+        )
+        seqlevels(gr, pruning.mode = "coarse") = seqlevels(bsg)
+        sq = BSgenome::getSeq(bsg, gr)
+        sq = as.character(sq)
+        return(sq)
+      }]
+      ## write pu
+      fwrite(pu, puFile, sep = "\t")
+    } else {
+      pu <-
+        fread(puFile)
+    }
+    
+    ## make sure query bins is a factor, as this is needed for downstream filtering
+    pu[, query_bin := factor(query_bin)]
+    
+    return(pu)
+    
+  }
+
+```
+
+
+```{r puList}
+
+registerDoParallel(cores = 24 )
+
+system.time(
+puList <-
+  foreach(bam = names(bamList)) %dopar% {
+    get_pileups(bamFile = bamList[[bam]], bamparam = bamparam, puparam = puparam, bsg = bsg, tmpDir = tmpDir)[, bam := bam] 
+  }
+)
+
+## sum counts of all samples
+pu <-
+  rbindlist(puList)[, .(count = sum(count)), by = setdiff(names(puList[[1]]), "count")]
+
+pu[, bootstrapFrac := 100] ## this is the full data
+
+head(pu)
+
+```
+
+# Analysis
+
+## Bootstrap
+```{r get_fraction_pileup function}
+
+#' A function to generate random bootstraps of BAM files
+#'
+#' @description
+#' This function performs a system call to samtools to generate randomly subsampled BAM files containing a fraction of the original reads.
+#' It then returns a data table with pileups for the individual fractions.
+#'
+#' @param
+#' bamFile path to a BAM file
+#' bamFrac vector of fractions to generate
+#' tmpDir path to directory where fractional BAM files are stored.
+#' samtoolsPath full path to samtools binary.
+get_fraction_pileup <-
+  function(bamFile = NULL, bamFrac = NULL, tmpDir = tmpDir, samtoolsPath = "samtools" ) {
+    if(!dir.exists(tmpDir))dir.create(tmpDir, showWarnings = FALSE, recursive = TRUE)
+    bamseed = 42
+    ## modified fractions for bootstrap in samtools compatible format (see samtools docs)
+    fracm <-
+      gsub("^0\\.", paste0(bamseed, "."), as.character(bamFrac / 100))
+    ## bootstrapped BAM file
+    fracBamFile <-
+      file.path(tmpDir, gsub(
+        "\\.bam$",
+        paste0(".fracm", gsub("\\.","_",fracm), ".bam"),
+        basename(bamFile)
+      ))
+    
+    if (!file.exists(fracBamFile)) {
+      system(paste(samtoolsPath, "view -b -s", fracm, bamFile,">", fracBamFile))
+      }
+    if (!file.exists(paste0(fracBamFile, ".bai") )) {
+       system(paste(samtoolsPath, "index", fracBamFile))
+    }
+    ## generate pileup
+    pu <-
+      get_pileups(bamFile = fracBamFile, bamparam = bamparam, puparam = puparam, bsg = bsg, tmpDir = tmpDir)
+    pu[, bootstrapFrac := bamFrac]
+    return(pu)
+    }
+
+```
+
+```{r bsList}
+
+#bootstrapFractions = setdiff((1:20)*5, 100)
+bootstrapFractions = setdiff((1:10)*10, 100)
+
+registerDoParallel(24)
+
+system.time(
+bsList <-
+foreach(bam = names(bamList)) %:% foreach(bsFrac = bootstrapFractions, .combine = rbind) %dopar% {
+  get_fraction_pileup(bamFile = bamList[[bam]],
+                      bamFrac = bsFrac,
+                      tmpDir = file.path(tmpDir, "bootstraps"),
+                      samtoolsPath = "~/mambaforge/envs/samtools/bin/samtools")[, bam := bam]
+}
+)
+names(bsList) = names(bamList)
+
+## sum counts of all samples
+bs <-
+  rbindlist(bsList)[, .(count = sum(count)), by = setdiff(names(bsList[[1]]), c("count", "bam") )]
+
+## append summed counts of full data
+bs <-
+  rbind(bs, pu[, .(count = sum(count)), by = setdiff(names(pu), c("count", "bam") )])
+
+head(bs)
+
+```
+
+```{r}
+# 
+# get_fraction_pileup(bamFile = bamList[[names(bamList)[[2]] ]],
+#                     bamFrac = bootstrapFractions[1],
+#                     tmpDir = file.path(tmpDir, "bootstraps"),
+#                     samtoolsPath = "~/mambaforge/envs/samtools/bin/samtools")#[, bam := names(bamList)]
+
+```
+
+
+```{r}
+head(bs[bootstrapFrac == 100, ])
+```
+
+
+```{r puw_from_pu function}
+## a function to generate, pre-filter and annotate pileup
+puw_from_pu <- function(pu){
+  ## cast to wide to get info about each covered position
+puw.intern <-
+  dcast(
+    pu, ## here we could filter for position in read with usebin
+    bootstrapFrac + seqnames + pos + strand + ref ~ nuc_corr ,
+    value.var = "count",
+    drop = c(TRUE, FALSE),
+    fill = 0,
+    fun.aggregate = sum
+    )
+## calculate total coverage
+puw.intern[, cvg := as.integer(rowSums(.SD)), .SDcols = c("A", "C", "G", "T", "-", "+")[c("A", "C", "G", "T", "-", "+") %in% colnames(puw.intern)]]
+require(matrixStats)
+require(GenomicFeatures)
+## only with defined reference base
+puw.intern <- puw.intern[ !is.na(ref) & !ref=="N", ]
+
+## only in reference transcripts
+puw.intern <- puw.intern[suppressWarnings(overlapsAny(GRanges(seqnames = seqnames, IRanges(start=pos, width =1), strand=strand), ex_by_tx)), ]
+
+## only where reference is major call
+puw.intern[ref == "A", is_major :=  `A` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "G", is_major :=  `G` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "C", is_major :=  `C` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "T", is_major :=  `T` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+
+puw.intern <- puw.intern[ which(is_major), ]
+
+## only reference C
+puw.intern <- puw.intern[ref == "C", ]
+
+## get c2t  ratio
+puw.intern[, c2t := `T` / `C`]
+
+
+## shift to (putative) A 
+puw.intern[, posA := ifelse(strand == "+", pos-1, pos+1)]
+
+## annotate
+puw.intern.gr <- 
+  GRanges(seqnames = puw.intern$seqnames, IRanges(start=puw.intern$posA, width =1), strand=puw.intern$strand, mcols = DataFrame(puw.intern[, !c("seqnames", "posA", "pos", "strand")]))
+
+puw.intern[, kmer := suppressWarnings(as.character(getSeq(bsg, puw.intern.gr +2)))] ## genomic kmer
+
+puw.intern[, kmer_DRACH := grepl("[ATG][AG]AC[ACT]",kmer)]
+puw.intern[, kmer_A := grepl("..A..",kmer)]
+puw.intern[, tx_DRACH := suppressWarnings(overlapsAny(puw.intern.gr, drach.gr)) ]
+puw.intern[, in_tx := overlapsAny(puw.intern.gr, ex_by_tx) ]
+puw.intern[, tx_A := kmer_A & in_tx]
+
+return(puw.intern)
+}
+
+```
+
+```{r define posfilter}
+
+posfilterN  = 0 ## exclude first N positions in reads
+
+posfilter = levels(bs$query_bin)[(1+posfilterN):length(levels(bs$query_bin))]
+
+posfilter
+
+```
+
+```{r bsw posfilter}
+
+## we filter for position in read using query_bin
+system.time(
+bsw <-
+  puw_from_pu(bs[query_bin %in% posfilter,])
+)
+
+head(bsw)
+
+```
+
+## Evaluate calling parameters
+Evaluate different calling parameters to find a balance between the number of called sites and their "purity" (i.e. the fraction of called A or DRACH). This is done only on the complete data, not the bootstraps.
+```{r evaluate calling parameters}
+require(ggplot2)
+require(doParallel)
+registerDoParallel(cores = 24 )
+
+## parameter space to evaluate
+eval_c2tNmin = 1:9
+eval_c2tmax = unique(c(seq(0, 0.4, 0.05), seq(0.4, 0.5, 0.01)))
+eval_c2tmin = unique(c(seq(0, 0.1, 0.01), seq(0.1, 0.5, 0.05)))
+
+eval_calls <-
+  function(puw = NULL, c2tNmin = NULL, c2tmin = NULL, c2tmax = NULL) {
+    hits = puw[ref == "C" & `T`>= c2tNmin & c2t > c2tmin & c2t <= c2tmax, ]
+    dt = data.table(
+      c2tNmin = c2tNmin,
+      c2tmin = c2tmin,
+      c2tmax = c2tmax,
+      nsites = nrow(hits),
+      nsites_A = sum(hits$tx_A),
+      nsites_DRACH = sum(hits$tx_DRACH)
+    )
+    dt[, frac_A := nsites_A / nsites]
+    dt[, frac_DRACH := nsites_DRACH / nsites]
+    dt[, A_in_DRACH := nsites_DRACH / nsites_A]
+    return(dt)
+  }
+
+paramtest <- 
+foreach(c2tNmin = eval_c2tNmin, .combine=rbind) %:% foreach(c2tmin = eval_c2tmin, .combine=rbind) %:% foreach(c2tmax = eval_c2tmax, .combine=rbind) %dopar% {
+  eval_calls(puw = bsw[bootstrapFrac == 100 & grepl("^chr", seqnames), ], c2tNmin = c2tNmin, c2tmin = c2tmin, c2tmax = c2tmax)
+  }
+
+paramtest
+
+```
+
+Plot parameter space to get an idea of valid parameters:
+```{r fig.width = 13, fig.height = 9}
+
+ggplot(paramtest, 
+       aes(x = frac_A, y = nsites)) +
+  geom_point(alpha = 0.1, aes(size = factor(c2tNmin))) +
+  geom_hline(yintercept = 30000, linetype = 2) +
+  geom_vline(xintercept = 0.85, linetype = 2) +
+  scale_y_continuous(trans="log10", limits = c(NA, NA)) + annotation_logticks(10, "l", TRUE) +
+  xlim(0.5, NA) +
+  #facet_wrap(~c2tNmin) +
+  NULL
+
+ggplot(paramtest, 
+       aes(x = A_in_DRACH, y = nsites)) +
+  geom_point(alpha = 0.1, aes(size = factor(c2tNmin))) +
+  geom_hline(yintercept = 30000, linetype = 2) +
+  geom_vline(xintercept = 0.85, linetype = 2) +
+  scale_y_continuous(trans="log10", limits = c(NA, NA)) + annotation_logticks(10, "l", TRUE) +
+  xlim(0.5, NA) +
+  #facet_wrap(~c2tNmin) +
+  NULL
+
+```
+So we could get ~ 30K called As of which more than 80% are in a DRACH.  
+
+Next, we define optimized parameters for calling sites:
+```{r}
+## define target minimum site "purity"
+target_frac_A = 0.85
+target_A_in_DRACH = 0.75 
+
+## define target minimum of called sites
+target_nsites = 25000
+target_nsites_A = 25000
+
+## rank filtered parameters by product of site quality and number
+paramtest[, eval_crit := NULL]
+paramtest[, callrank := NULL]
+paramtest[, eval_crit := nsites_DRACH * A_in_DRACH]
+paramtest[frac_A >= target_frac_A &
+            A_in_DRACH >= target_A_in_DRACH &
+            nsites > target_nsites,
+          callrank := rank(-eval_crit, na.last = TRUE) ]
+
+## define parameter cutoffs
+call_c2tNmin = paramtest[!is.na(callrank), ][order(callrank), ][1, c2tNmin]
+call_c2tmin  = paramtest[!is.na(callrank), ][order(callrank), ][1, c2tmin]
+call_c2tmax  = paramtest[!is.na(callrank), ][order(callrank), ][1, c2tmax]
+
+paramtest[!is.na(callrank), ][order(callrank), ]
+
+```
+
+## Call sites
+Now we can use de parameters defined above to call sites in all bootstraps.
+```{r call}
+
+# bsw[, call := ifelse(
+#   test = ref == "C" &
+#     (`T` >= call_c2tNmin &
+#        c2t >= call_c2tmin &
+#        c2t < call_c2tmax),
+#   yes = "methylated",
+#   no = ifelse(
+#     test = ref == "C" &
+#       `T` <= 0 & cvg >= 90,
+#     yes = "unmethylated",
+#     no = "intermediate"
+#   )
+# )]
+
+bsw[, call := NULL]
+bsw[cvg > 90, call := "unmethylated"]
+bsw[ref == "C" & `T` > 0, call := "intermediate"]
+bsw[ref == "C" &
+    (`T` >= call_c2tNmin &
+       c2t >= call_c2tmin &
+       c2t < call_c2tmax), call := "methylated"]
+
+bsw[, call := factor(call)]
+
+bsw[bootstrapFrac == 100, .(N = .N, fracDRACH = sum(tx_DRACH)/length(tx_DRACH)*100), by = "call" ]
+
+```
+
+
+Overview plot:
+
+```{r plot_miclip_summary function}
+
+plot_miclip_summary <-
+  function(gr = NULL) {
+    p.hits.table <-
+      ggtexttable(tribble(~"", ~"", 
+                          "sites", as.character(length(gr)),
+                          "A", as.character(sum(gr$tx_A)),
+                          "DRACH", as.character(sum(gr$tx_DRACH)),
+                          "% A", as.character(round(sum(gr$tx_A)/length(gr)*100, 2)), 
+                          "% DRACH", as.character(round(sum(gr$tx_DRACH)/length(gr)*100, 2)),
+                          "% A in DRACH", as.character(round(sum(gr$tx_DRACH)/sum(gr$tx_A)*100, 2))),
+                  rows = NULL, cols = NULL)
+    
+    p.hits.logo <-
+      ggplot() + geom_logo(as.character(gr$kmer),
+                           seq_type = "dna",
+                           method = "probability") +
+      ylim(0, 1) +
+      #labs(title = "Called C>T transitions", subtitle = p.hits.subtit) +
+      NULL
+    
+    
+    
+    p.hits.meta <-
+      ggplot(data.frame(relpos.cds = relpos.cds.gr(suppressWarnings(
+        mapToTranscripts(gr, ex_by_tx)
+      ))), aes(x = relpos.cds)) +
+      geom_histogram(binwidth = 0.02) +
+      geom_vline(
+        xintercept = c(1, 2),
+        linetype = 2,
+        col = "blue",
+        lwd = 0.3
+      ) +
+      xlim(0.5, 3)
+    
+    p <-
+      ggarrange(
+        p.hits.logo,
+        p.hits.table,
+        p.hits.meta,
+        ncol = 1,
+        nrow = 3,
+        align = "v"
+      )
+    return(p)
+  }
+
+```
+
+
+```{r ## miclip_summary ,fig.width=10, fig.height=8}
+require(tibble)
+
+hits <- 
+  bsw[bootstrapFrac == 100 & call == "methylated"  ,]
+
+hits.gr <- 
+  GRanges(seqnames = hits$seqnames,
+          IRanges(start=hits$posA, width =1),
+          strand=hits$strand)
+seqlevels(hits.gr) = seqlevels(ex_by_tx)
+
+mcols(hits.gr) <-
+  DataFrame(hits[, c("cvg", "c2t", "A", "C", "G", "T", "ins", "del", "kmer", "tx_DRACH", "tx_A")])
+
+
+p.hits.paramspace <-
+  ggplot(paramtest, 
+       aes(x=A_in_DRACH, y= nsites_DRACH)) +
+  geom_point(alpha = 0.1) +
+  geom_point(data = function(x)x[callrank == 1, ], col = "red", size = 2) +
+  geom_hline(yintercept = target_nsites_A, linetype =2) +
+  #geom_vline(xintercept = target_frac_DRACH, linetype = 2) +
+  scale_y_continuous(trans="log10", limits = c(NA, NA)) + annotation_logticks(10, "l", TRUE) +
+  xlim(0.5, NA) +
+  facet_wrap(~c2tNmin, labeller = label_both) +
+  NULL
+
+annotate_figure(ggarrange(p.hits.paramspace, plot_miclip_summary(hits.gr),  ncol = 2, widths = c(3,1) ),
+                top = paste0("posfilterN=", posfilterN,
+                              " | c2tNmin=",
+                              call_c2tNmin,
+                              " | c2tmin=",
+                              call_c2tmin,
+                              " | c2tmax=",
+                              call_c2tmax
+                              )
+                )
+
+
+# save_last_plot(file = file.path(plotDir, "region_histogram.pdf"), owncube_dir = "exports/plots", width = 25, height = 8, scale = 2)
+
+```
+```{r ## miclip_bootstrap,  fig.width = 9, fig.height = 4}
+
+bckgrnd_DRACH = 3/4*2/4*1*1/4*3/4 * 100
+
+annotate_figure(
+  ggarrange(
+    
+    ggplot(bsw[, .(fracDRACH = sum(tx_DRACH) / length(tx_DRACH) * 100), by = c("bootstrapFrac", "call")],
+           aes(
+             x = bootstrapFrac, y = fracDRACH, col = call
+           )) +
+      geom_hline(yintercept = bckgrnd_DRACH, linetype = 2) +
+      geom_text(x = -Inf, y = bckgrnd_DRACH, label = paste0("Background DRACH (",round(bckgrnd_DRACH, 1),"%)"), check_overlap = TRUE, col = "black", size = 3, hjust = 0, vjust = -0.2) +
+      geom_point() +
+      geom_smooth(aes(fill = call)) +
+      ylim(0, 100) +
+      xlim(0, 100) +
+      #coord_fixed() +
+      labs(x = "Bootstrap [%]", y = "Fraction in DRACH [%]") +
+      theme_pubr(legend = "right")
+    ,
+    ggplot(bsw[call == "methylated", .N, by = c("bootstrapFrac", "call")],
+           aes(
+             x = bootstrapFrac, y = N, col = call
+           )) +
+      geom_point() +
+      geom_smooth(method = "lm") +
+      xlim(0, 100) +
+      labs(x = "Bootstrap [%]", y = expr("Called" ~ m ^ 6 * A ~ "sites [N]")) +
+      theme_pubr(legend = "right")
+    ,
+    ncol = 2,
+    common.legend = TRUE,
+    #align = "v",
+    legend = "right"
+  ),
+  top = paste0(
+    "c2tNmin=",
+    call_c2tNmin,
+    " | c2tmin=",
+    call_c2tmin,
+    " | c2tmax=",
+    call_c2tmax
+  )
+)
+
+```
+
+## BED file export
+We export all covered DRACH sites into a BED file and include the methylation status call in the site name.
+```{r}
+
+dir.create("../../results/analysis_miCLIP")
+
+fwrite(
+  bsw[bootstrapFrac == 100 & tx_DRACH == TRUE, ## all C2T transitions in DRACH (only from full dataset)
+       .(
+         chr    = seqnames,
+         start  = format(posA -1 , scientific = FALSE), ## bed is 0-based
+         end    = format(posA    , scientific = FALSE),
+         name   = paste0(call,
+                         "_cvg", cvg,
+                         "_c", `C`,
+                         "_t", `T`),
+         score  = format(c2t *1000, digits = 3, scientific = FALSE), ## bed file format specifies score between 0 and 1000
+         strand = strand)],
+  file = "../../results/analysis_miCLIP/miclip_c2t.bed",
+  sep = "\t",
+  row.names = F,
+  col.names = F
+)
+
+fread("../../results/analysis_miCLIP/miclip_c2t.bed")
+
+```
+
+### --- Experimental code ---
+
+```{r ### stop ###}
+stop()
+```
+
+```{r}
+
+bsw[bootstrapFrac == 100 & tx_DRACH == TRUE,]
+
+bed.gr <-
+  import("../../results/analysis_miCLIP/miclip_c2t.bed")
+
+bed.tx <-
+  mapToTranscripts(bed.gr, ex_by_tx)
+
+bed.gr
+
+```
+
+
+```{r}
+
+test <-
+relpos.cds.gr(suppressWarnings(
+        mapToTranscripts(hits.gr, ex_by_tx)
+      ))
+
+table(is.na(test))
+
+```
+
+
+```{r}
+paramtest[order(-eval_crit, na.last = TRUE), ]
+
+paramtest[nsites_A > 30000, ][order(-A_in_DRACH), ]
+paramtest[nsites_A > 30000, ][order(-frac_A), ]
+
+paramtest[A_in_DRACH > 0.75, ][order(-nsites_A), ]
+
+paramtest[frac_A > 0.8, ][order(-nsites_A), ]
+
+```
+
+
+```{r fig.width = 16, fig.height = 8}
+
+plotdat <-
+  pu[grepl("^chr", seqnames), ]
+
+plotdat[, mut := paste0(ref, ">", nuc_corr)]
+plotdat[grepl("ins", mut), mut := "ins"]
+plotdat[grepl("del", mut), mut := "del"]
+plotdat[, mut := factor(mut, levels = c("ins", "del", grep("ins|del", sort(unique(mut)), invert = T, value = T)))]
+
+ggplot(plotdat[nuc_corr != ref & ref != "N", .(count = sum(count)), by = c("strand", "mut", "bam") ],
+       aes(x = mut, y = count, fill = strand)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~bam, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  NULL
+
+```
+
+```{r fig.width = 16, fig.height = 8}
+
+plotdat <-
+  pu[grepl("^chr", seqnames), ]
+
+plotdat[, mut := paste0(ref, ">", nuc_corr)]
+plotdat[grepl("ins", mut), mut := "ins"]
+plotdat[grepl("del", mut), mut := "del"]
+plotdat[, mut := factor(mut, levels = c("ins", "del", grep("ins|del", sort(unique(mut)), invert = T, value = T)))]
+
+plotdat[, readpos := as.integer(query_bin)]
+
+plotdat <-
+  plotdat[ref != nuc_corr & readpos != max(readpos) & ref != "N", .(count = sum(count)), by = c("readpos", "mut", "bam") ]
+
+ggplot(plotdat,
+       aes(x=readpos,  y= count)) +
+  geom_line(aes(col = mut)) +
+  facet_wrap(~bam, scales = "free_y") +
+  theme(legend.position = "right") +
+  NULL
+
+```
+
+```{r}
+
+plotdat <-
+  pu[as.integer(query_bin) > 1 & nuc_corr != ref, .(count = sum(count)), by = setdiff(names(pu), c("count", "query_bin"))]
+
+```
+
+
+```{r, fig.width = 20, fig.height = 10}
+
+bs[, mut := paste0(ref, ">", nuc_corr)]
+bs[grepl("ins", mut), mut := "ins"]
+bs[grepl("del", mut), mut := "del"]
+bs[, mut := factor(mut, levels = c("ins", "del", grep("ins|del", sort(unique(mut)), invert = T, value = T)))]
+
+ggplot(bs[! mut %in% c("G>G", "A>A", "C>C", "T>T") & !is.na(ref) & ref !="" & !ref=="N",.N, by=c("mut", "bootstrapFrac", "query_bin")],
+       aes(x=mut, y= N)) + 
+  geom_bar(stat="identity", aes(fill=mut), show.legend = F) +
+  facet_wrap(query_bin~bootstrapFrac, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  NULL
+
+```
+
+
+
+
+
+```{r}
+
+
+get_relpos <-
+  function(dt, ex_by_tx){
+    gr <-
+    GRanges(seqnames = dt$seqnames,
+          IRanges(start=dt$posA, width =1),
+          strand=dt$strand)
+    seqlevels(gr) = seqlevels(ex_by_tx)
+    tx <-
+       mapToTranscripts(gr, ex_by_tx)
+    res <-
+      data.table(relpos.cds = relpos.cds.gr(suppressWarnings(
+        mapToTranscripts(gr, ex_by_tx)
+      )))
+    return(res)
+  }
+
+test <-
+foreach(cl = levels(bsw$call), .combine = rbind) %dopar% {
+  get_relpos(bsw[bootstrapFrac == 100 & call == cl  ,], ex_by_tx)[, call := cl]
+}
+
+ggplot(test, 
+       aes(x=relpos.cds, col = call))+
+  #geom_freqpoly(binwidth = 0.02) +
+  geom_density() +
+      geom_vline(
+        xintercept = c(1, 2),
+        linetype = 2,
+        col = "blue",
+        lwd = 0.3
+      ) +
+      xlim(0.5, 3) +
+  NULL
+
+```
+
+
+## Benchmark
+
+```{r}
+
+
+# liftover to GRCh38
+#chainFileURL = "http://hgdownload.cse.ucsc.edu/goldenpath/hg19/liftOver/hg19ToHg38.over.chain.gz"
+chainFileURL = "http://hgdownload.cse.ucsc.edu/goldenpath/hg38/liftOver/hg38ToHg19.over.chain.gz"
+chainFileGZ = file.path(tmpDir, basename(chainFileURL))
+chainFile = gsub("*\\.gz$", "", chainFileGZ)
+if(!file.exists(chainFile)){
+  if(!file.exists(chainFileGZ))download.file(chainFileURL, chainFileGZ)
+  GEOquery::gunzip(chainFileGZ, chainFile)
+}
+c2t <-
+  unlist(rtracklayer::liftOver(c2t, import.chain(chainFile)))
+
+```
+
+
+### MasterList
+```{r}
+
+dataURL = "https://linder.owncube.com/index.php/s/ML43zTddqi7wXoE/download"
+dataFile = file.path(tmpDir, "master.cims.unique.bed")
+if(!file.exists(dataFile))download.file(dataURL, dataFile)
+
+bed.gr <- 
+  rtracklayer::import(dataFile)  
+
+bed.gr$kmer <-
+  suppressWarnings(as.character(getSeq(bsg, bed.gr +2)))
+
+## determine DRACH by genomic kmer
+bed.gr$kmer_DRACH = grepl("[ATG][AG]AC[ACT]",bed.gr$kmer)
+bed.gr$kmer_A = grepl("..A..",bed.gr$kmer)
+
+## the A can be safely determined from the genomic kmer. However, we need to filter for only those that are in ex_by_tx, otherwise ratio to DRACH will be skewed by intergenic sites
+bed.gr$in_tx = overlapsAny(bed.gr, ex_by_tx)
+bed.gr$tx_A  = bed.gr$kmer_A & bed.gr$in_tx
+
+bed.gr$tx_DRACH = suppressWarnings(overlapsAny(bed.gr, drach.gr))
+
+ggarrange(
+  annotate_figure(plot_miclip_summary(hits.gr), top = paste0("Nc2tmin=", call_c2tNmin, " | c2tmin=", call_c2tmin, " | c2tmax=", call_c2tmax)),
+  annotate_figure(plot_miclip_summary(bed.gr ), top = "miCLIP master list"), ncol = 2
+)
+
+```
+
+### Nature Methods
+Comapare to original miCLIP dataset:
+```{r}
+
+dataURL = "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE63nnn/GSE63753/suppl/GSE63753_hek293.abcam.CIMS.m6A.9536.bed.txt.gz"
+dataFile = file.path(tmpDir, basename(dataURL))
+if(!file.exists(dataFile))download.file(dataURL, dataFile)
+
+bed.gr <-
+makeGRangesFromDataFrame(
+setnames(fread(dataFile), paste0("V", 1:6), c('chr', 'start', 'end', 'id', 'score', 'strand')),
+keep.extra.columns =T,
+starts.in.df.are.0based = T)
+
+seqlevels(bed.gr) = seqlevels(ex_by_tx)
+
+bed.gr$kmer <-
+  suppressWarnings(as.character(getSeq(bsg, bed.gr +2)))
+
+## determine DRACH by genomic kmer
+bed.gr$kmer_DRACH = grepl("[ATG][AG]AC[ACT]",bed.gr$kmer)
+bed.gr$kmer_A = grepl("..A..",bed.gr$kmer)
+
+## the A can be safely determined from the genomic kmer. However, we need to filter for only those that are in ex_by_tx, otherwise ratio to DRACH will be skewed by intergenic sites
+bed.gr$in_tx = overlapsAny(bed.gr, ex_by_tx)
+bed.gr$tx_A  = bed.gr$kmer_A & bed.gr$in_tx
+bed.gr$tx_DRACH = suppressWarnings(overlapsAny(bed.gr, drach.gr))
+
+
+ggarrange(
+  annotate_figure(plot_miclip_summary(hits.gr), top = paste0("Nc2tmin=", call_c2tNmin, " | c2tmin=", call_c2tmin, " | c2tmax=", call_c2tmax)),
+  annotate_figure(plot_miclip_summary(bed.gr ), top = "Linder et al. 2018"), ncol = 2
+)
+
+```
+
+
+
+## Calculations of DRACH abundance
+The distribution of Cs in DRACHes in the pileups is way higher than the theoretical mean (~7%)
+### theoretical
+```{r}
+
+## theoretical DRACH fraction for all Cs (all 4 nuc equally abundant)
+DRACH_frac_theo = (3/4)*(2/4)*(1/4)*(1)*(3/4) * 100 
+print(DRACH_frac_theo)
+
+## DRACH fraction for all Cs in txmodel
+DRACH_frac_txmodel = length(drach.tx) / length(unlist(vmatchPattern("C", tx.seqs, fixed = TRUE))) * 100
+print(DRACH_frac_txmodel)
+
+## DRACH fraction for Cs with IPed reads coverage but without transition (C == cvg)
+DRACH_frac_notrans = tdt(bsw[bootstrapFrac == 100 &  ref=="C" & C == cvg,  .N , by = .(tx_DRACH)])[, `TRUE`/(`TRUE`+`FALSE`)*100 ]
+print(DRACH_frac_notrans)
+
+## DRACH fraction for Cs with exactly one transition (T == 1)
+DRACH_frac_onetrans = tdt(bsw[bootstrapFrac == 100 &  ref=="C" & `T` == 1,  .N , by = .(tx_DRACH)])[, `TRUE`/(`TRUE`+`FALSE`)*100 ]
+print(DRACH_frac_onetrans)
+
+## DRACH fraction for Cs with at least one transition (T >= 1)
+DRACH_frac_alltrans = tdt(bsw[bootstrapFrac == 100 &  ref=="C" & `T` >= 1,  .N , by = .(tx_DRACH)])[, `TRUE`/(`TRUE`+`FALSE`)*100 ]
+print(DRACH_frac_alltrans)
+
+## DRACH fraction in called hits
+DRACH_frac_called = sum(hits.gr$tx_DRACH) / length(hits.gr$tx_DRACH)  *100
+print(DRACH_frac_called)
+
+```
+
+
+
+
+## plot rariant
+```{r, fig.width=12, fig.height = 4}
+require(Rariant)
+require(ggbio)
+require(Biostrings)
+require(ggbio)
+
+
+gr.actb <- GRanges(seqnames = "chr7", IRanges(5567374, width = 1), strand = "-") ## actb site
+gr.eef2 <- GRanges(seqnames = "chr19", IRanges(3976466, width = 1), strand = "-") ## eef2 site
+#gr.eef2 <- GRanges(seqnames = "chr19", IRanges(3976161, width = 1), strand = "-") ## eef2 site
+
+gr.atf4 <- GRanges(seqnames = "chr22", IRanges(39916568, width = 1), strand = "+") ## atf4 m6Am
+gr.hspa1b <- GRanges(seqnames = "chr6", IRanges(31795649, width = 1), strand = "+") ## hsp70 utr5
+
+gr = gr.actb
+
+bsw[bootstrapFrac == 100  & seqnames == as.character(seqnames(gr)) & strand == as.character(strand(gr))  & pos %in% (start(gr+2):end(gr+2)) ,  ][]
+
+winsize = 25 
+
+## we need to generate an new GRanges and drop the strand, as tallyPlot is not strand aware
+gr2 = GRanges(seqnames(gr), IRanges(start(gr), end(gr))) + winsize
+
+p.bf  <- 
+  tallyPlot(file = bamFile , region = gr2, ref = Hsapiens, nCycles = 5) +
+    geom_vline(xintercept = start(gr), linetype=2)
+## reference sequence
+p.ref <- autoplot(Hsapiens, gr2) + theme_clear() + theme(legend.position="none")
+## todo: add DRACHes p.drach.pos <- autoplot(drach.pos)
+
+tracks(bf = p.bf,  ref = p.ref,  heights = c(5, 0.5) )
+
+```
+
+```{r}
+stop()
+```
+
+
+look for recalls
+```{r}
+
+
+
+get_recall <-
+  function(dt, bs){
+    dt <-
+      dt[call == "methylated", ]
+    dt[, id := paste(seqnames, pos, strand, sep="_")]
+    current <- 
+      dt[bootstrapFrac == bs, ]
+    previous <-
+      dt[bootstrapFrac <  bs, ]
+    current[, is_recall := id %in% unique(previous$id)]
+    return(current)
+  }
+
+
+
+recall <-
+foreach(bs = unique(bsw$bootstrapFrac), .combine = rbind ) %dopar% {
+  get_recall(dt = bsw, bs = bs)
+ }
+
+recall_agg <-
+  dcast(recall[, .N, by = c("bootstrapFrac", "is_recall")],bootstrapFrac ~ ifelse(is_recall, "recall", "firstcall"), value.var = "N", fill = NA)
+
+recall_agg[, totalcall := firstcall + recall]
+
+ggplot(recall_agg, 
+       aes(x=bootstrapFrac, y = totalcall)) +
+  geom_point() +
+  geom_smooth()
+
+
+recall_agg$recall_binsize = foreach(i = 1:nrow(recall_agg), .combine = c) %do% {recall_agg[i,  recall_agg[i+1, bootstrapFrac] - recall_agg[i, bootstrapFrac] ] }
+
+
+recall_agg$recall_binsize = (c(recall_agg$bootstrapFrac, 100) - c(0, recall_agg$bootstrapFrac))[1:nrow(recall_agg)]
+
+ggplot(recall_agg, 
+       aes(x=bootstrapFrac, y = firstcall)) +
+  geom_point() +
+  geom_smooth()
+
+ggplot(recall_agg, 
+       aes(x=totalcall, y = firstcall)) +
+  geom_point() +
+  geom_smooth() +
+  geom_smooth(data = function(x)x[bootstrapFrac > 30, ], method = "lm", fullrange = TRUE) +
+  ylim(0, NA) +
+  xlim(0, 5e4) +
+  NULL
+
+```
+
+
+
+

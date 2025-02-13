@@ -1,0 +1,917 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Transcript model
+
+```{r}
+
+if(!exists("mouse_m6A")){mouse_m6A <-
+  within(list(), {
+    canonical_transcripts <- 
+      getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "transcript_is_canonical", "external_gene_name"),
+            filters = "transcript_is_canonical",
+            values = TRUE,
+            mart = useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl") )
+    canonical_transcripts = as.data.table(canonical_transcripts)
+    setnames(canonical_transcripts, "external_gene_name", "gene")
+  })}
+
+head(mouse_m6A$canonical_transcripts)
+
+```
+
+```{r}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    txURL = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M10/gencode.vM10.annotation.gtf.gz"
+    txFile = file.path(tmpDir, basename(txURL))
+    if(!file.exists(txFile))download.file(txURL, txFile)
+    
+    fastaURL = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M10/GRCm38.primary_assembly.genome.fa.gz"
+    fastaFile = file.path(tmpDir, basename(fastaURL))
+    if(!file.exists(fastaFile))download.file(fastaURL, fastaFile)
+    
+    
+    txdatfile = file.path(dirname(txFile), paste0(basename(txFile),".txdat.RData"))
+    # file.remove(txdatfile)
+    if(!file.exists(txdatfile)){
+      cat("Generating txmodel...")
+      txdat <-
+        get_txdat_from_gtf(txFile)
+      save(txdat, file = txdatfile )
+      cat(" ...done.\n")
+    }else{cat("Loading txmodel..."); load(txdatfile);cat(" ...done.\n") }
+    
+    txmodel = txdat$txmodel
+    ex_by_tx = txdat$ex_by_tx
+    
+    txmodel[! is.na(cds_len) , is_longest_cds := {
+      ## pick the longest CDS (in case of equal length, we simply pick the first)
+      x = cds_len == max(cds_len, na.rm = TRUE)
+      hit = min(which(x))
+      x = rep(FALSE, length(x))
+      x[hit] = TRUE
+      x
+    }, by = .(gene_id) ]
+    
+    #txmodel[, is_protein_coding := gene_id %in% gtf_dt[gene_type == "protein_coding", unique(gene_id)] ]
+    
+    txmodel[, is_QC_pass := utr5_len > 10 & cds_len  > 60 & cds_len < 10000 & utr3_len > 60]
+    
+    txmodel <-
+      txmodel[ is_longest_cds & is_QC_pass]
+    
+    cat(
+      paste(
+        "Filtering for valid transcripts leaves", nrow(txmodel), "out of", nrow(txdat$txmodel), "transcripts.\n"
+      )
+    )
+    
+    stopifnot(txmodel[, length(gene_id) == length(unique(gene_id))])
+    
+    txmodel[, ensembl_gene_id := gsub("\\..*$", "", gene_id)]
+    txmodel[, gene := setkeyv(canonical_transcripts, "ensembl_gene_id")[ensembl_gene_id, gene]]
+    txmodel[, exlen := unlist(lapply(cds_exon_len, mean, na.rm=TRUE))] ## get mean CDS exon lenth per transcript
+    txmodel[, exlen_max := unlist(lapply(cds_exon_len, max, na.rm=TRUE))] ## get mean CDS exon lenth per transcript
+    
+  })
+
+head(mouse_m6A$txmodel)
+
+```
+
+
+
+
+
+
+```{r}
+
+mouse_m6A$ex_by_tx <-
+  mouse_m6A$txdat$ex_by_tx[names(mouse_m6A$txdat$ex_by_tx) %in% as.character(mouse_m6A$txmodel$tx_name)]
+
+```
+
+
+```{r}
+
+mouse_m6A$bsg  <-
+    create_BSgenome(fastaFile = mouse_m6A$fastaFile, organism = "Mus musculus", genome = "mm10")
+
+mouse_m6A$bsg
+
+```
+
+```{r}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    
+    ## get reference sequence
+    seqlevelsStyle(bsg) = seqlevelsStyle(ex_by_tx)
+    tx.seqs = extractTranscriptSeqs(bsg, keepStandardChromosomes(ex_by_tx, pruning.mode = "coarse"))
+    
+    ## get drach motifs
+    drach.tx <-
+      GRanges(vmatchPattern("DRACH", tx.seqs, fixed = F)) - 2 # center on A
+    
+    ## annotate
+    drach.tx$kmer <-
+      getSeq(tx.seqs, drach.tx + 2)
+    drach.tx$relpos.cds <-
+      relpos.cds.gr(drach.tx, txmodel = txmodel)
+    drach.tx$region <-
+      get_region(drach.tx, txmodel)
+    drach.tx$region = factor(drach.tx$region, levels = c("utr5", "cds", "utr3") )
+    drach.tx$frame <-
+      get_frame(drach.tx, txmodel = txmodel)
+    drach.tx$codon = substr(drach.tx$kmer, 3 - as.numeric(as.character(drach.tx$frame)) , 3 - as.numeric(as.character(drach.tx$frame)) + 2 )
+    
+    drach.tx
+    
+  })
+
+```
+
+
+
+
+# m6A sites 
+## miCLIP
+
+
+```{r}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    tar_file = file.path(tmpDir, "GSE86336_RAW.tar")
+    bed_file = file.path(tmpDir, "GSM2300430_precise_m6A_sites_mESC_mm10.bed.gz")
+    if(!(file.exists(tar_file)|file.exists(bed_file))){
+      download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE86336&format=file", tar_file)
+      # untar(tar_file, list = TRUE)
+      untar(tar_file, exdir = tmpDir)
+    }
+    
+    bed <-
+      import.bed(bed_file)
+    
+    bed$siteID = 1:length(bed)
+    
+    bed$is_m6A <-
+      rep(TRUE, length(bed))
+    
+    ## map to transcripts
+    seqlevels(bed, pruning.mode = "coarse") <-
+      seqlevels(ex_by_tx)
+    bed.tx <-
+      mapToTranscripts(x = bed, transcripts =  ex_by_tx)
+    strand(bed.tx) = "+"
+    
+    mcols(bed.tx) <-
+      cbind(mcols(bed.tx), mcols(bed)[bed.tx$xHits,])
+    
+    bed.tx$relpos.cds <-
+      relpos.cds.gr(gr = bed.tx, txmodel = txmodel)
+    
+    bed.tx$frame <-
+      get_frame(bed.tx, txmodel = txmodel)
+    
+    bed.tx$region <- 
+      get_region(bed.tx, txmodel = txmodel)
+    
+    bed.tx$framelabel <- 
+      get_framelabel(frame = bed.tx$frame)
+    
+        bed.tx$kmer <-
+      get_kmer(gr = trim(bed.tx + 2), tx.seqs)
+
+  })
+
+head(as.data.table(mouse_m6A$bed.tx))
+
+
+```
+
+```{r lift miCLIP to drach}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    
+    drach.tx$is_m6A_miCLIP <-
+      suppressWarnings(overlapsAny(drach.tx, bed.tx[bed.tx$is_m6A]))
+    
+    ### annotate with miCLIP info
+    drach.c2t.hits <-
+      suppressWarnings(findOverlaps(query = drach.tx, subject = bed.tx ))
+    drach.tx$is_m6A_miCLIP <- FALSE
+    drach.tx[queryHits(drach.c2t.hits)]$is_m6A_miCLIP <-
+      bed.tx[subjectHits(drach.c2t.hits)]$is_m6A
+    
+  })
+
+head(mouse_m6A$drach.tx,3)
+table(mouse_m6A$drach.tx$is_m6A_miCLIP)
+
+```
+
+```{r}
+
+as.data.table(mouse_m6A$bed.tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , {cbind(N=.N)}
+    , by = .(is_DRACH)
+  ]
+
+
+as.data.table(mouse_m6A$bed.tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , .N
+    , by = .(kmer, is_DRACH = ifelse(is_DRACH, "DRACH", "other") )
+  ][
+    order(-N)
+    , 
+    ][
+      N > 100 & nchar(kmer) == 5
+    ][
+      ,
+      ggplot(.SD,
+             aes(x = factor(kmer, levels = unique(kmer[order(N)])),
+                 y = N,
+                 fill = is_DRACH)) +
+        geom_col() +
+        coord_flip() +
+        scale_y_continuous(trans = "log10") + annotation_logticks(sides = "b") +
+        theme_bw() +
+        theme(axis.text.y = element_text(family = "Courier",size = 7, hjust =0.5)) +
+        labs(x = "Motif", y = "Sites [N]", fill = "")
+      
+    ]
+
+```
+
+## GLORI
+```{r}
+
+mouse_m6A$glori  <-
+  within(list(), {
+    dataURL = "https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-022-01487-9/MediaObjects/41587_2022_1487_MOESM8_ESM.xlsx"
+    dataFile = file.path(tmpDir, basename(dataURL))
+    if(!file.exists(dataFile)){download.file(dataURL, dataFile)}
+    
+  })
+
+```
+
+```{r}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    glori$dt <-
+      foreach(sheet = c("HS un-change m6A", "HS UP m6A", "HS Down m6A"), .combine = rbind) %do% {
+        as.data.table(read_xlsx(glori$dataFile, sheet = sheet))
+      }
+    glori$dt[, m6A_lvl := meth_control / 100 ]
+    
+    ## the file has no strand information; in principle we could use both + and minus and only retain DRACH motifs
+    glori$gr = glori$dt[, GRanges(seqnames = seqnames, ranges = IRanges(start = start, width = 1), strand = "*", m6A_lvl, score = m6A_lvl)]
+    
+    ## map to transcripts
+    glori$tx <-
+      mapToTranscripts(x = glori$gr, transcripts =  ex_by_tx)
+    strand(glori$tx) = "+"
+    mcols(glori$tx) <-
+      cbind(mcols(glori$tx), mcols(glori$gr)[glori$tx$xHits,])
+    glori$tx$relpos.cds <-
+      relpos.cds.gr(glori$tx, txmodel = txmodel)
+    glori$tx$frame <-
+      get_frame(gr = glori$tx, txmodel = txmodel)
+    glori$tx$region <-
+      factor(get_region(glori$tx, txmodel), levels = c("utr5", "cds", "utr3"))
+    glori$tx$kmer <-
+      get_kmer(gr = trim(glori$tx + 2), tx.seqs)
+      # getSeq(tx.seqs, trim(glori$tx + 2))
+    
+  })
+
+head(mouse_m6A$glori$dt)
+
+mouse_m6A$glori$tx
+
+```
+
+```{r}
+
+with(mouse_m6A, {
+  
+as.data.table(glori$tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , {cbind(N=.N, mean_se(m6A_lvl))}
+    , by = .(is_DRACH)
+  ]
+
+as.data.table(glori$tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , {cbind(N=.N, mean_sd(m6A_lvl*100))}
+    , by = .(kmer, is_DRACH = ifelse(is_DRACH, "DRACH", "other") )
+  ][
+    order(-N)
+    , 
+    ][
+      N > 100 & nchar(kmer) == 5
+    ][
+      ,
+      ggarrange(
+      ggplot(.SD,
+             aes(x = factor(kmer, levels = unique(kmer[order(N)])),
+                 y = N,
+                 fill = is_DRACH)) +
+        geom_col() +
+        coord_flip() +
+        scale_y_continuous(trans = "log10") + annotation_logticks(sides = "b") +
+        theme_bw() +
+        theme(axis.text.y = element_text(family = "Courier",size = 7, hjust =0.5)) +
+        labs(x = "Motif", y = "Sites [N]", fill = "")
+      ,
+      ggplot(.SD,
+             aes(x = factor(kmer, levels = unique(kmer[order(N)])),
+                 y = y,
+                 col = is_DRACH)) +
+        geom_errorbar(aes(ymin=ymin, ymax=ymax), width = 0) +
+        geom_point() +
+        coord_flip() +
+        theme_bw() +
+        theme(axis.text.y = element_blank(), axis.title.y = element_blank()) +
+        labs(y = "Avg. m6A level [%]"),
+      ncol = 2, common.legend = TRUE
+      )
+    ]
+})
+
+```
+
+```{r lift glori to DRACH}
+
+mouse_m6A <-
+  within(mouse_m6A,{
+    drach.tx.glori.hits <-
+  suppressWarnings(findOverlaps(query = drach.tx, subject = glori$tx))
+
+drach.tx$glori_m6A_lvl <- as.numeric(0)
+
+drach.tx[queryHits(drach.tx.glori.hits)]$glori_m6A_lvl <-
+  glori$tx[subjectHits(drach.tx.glori.hits)]$m6A_lvl
+  })
+
+mouse_m6A$drach.tx
+
+```
+
+# Regions
+
+```{r m6A_region_miCLIP}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    m6A_region_miCLIP <-
+      setnames(as.data.table(drach.tx), "seqnames", "tx_name")[
+        , merge(.SD, txmodel[, .(tx_name, ensembl_gene_id)], "tx_name")
+      ][
+        ( is_m6A_miCLIP )
+      ][
+        , .(N_m6A = .N)
+        , by = .(ensembl_gene_id, region)
+      ][
+        , merge(canonical_transcripts, .SD, all.x = TRUE) ## we need all.x = TRUE to include genes without m6A
+      ][
+        , .(gene, region, N_m6A)
+      ][
+        , region := factor(region, levels = c("utr5", "cds", "utr3"))
+      ][
+        , dcast(.SD, gene ~ region, value.var = "N_m6A", fun.aggregate = sum, fill = 0)
+      ][
+        !is.na(gene) , !"NA"
+      ][
+        , m6A_region := ifelse(utr5+cds+utr3 == 0,
+                               "none",
+                               paste0(
+                                 ifelse(utr5 > 0, "utr5", ""),
+                                 ifelse(cds  > 0, "cds",  ""),
+                                 ifelse(utr3 > 0, "utr3", "")
+                               ))
+      ][
+        , m6A_region := factor(m6A_region, levels = c("none", "utr5", "utr5cds", "utr5cdsutr3", "cds", "cdsutr3", "utr3", "utr5utr3")) 
+      ][
+        
+      ]
+  })
+
+
+
+mouse_m6A$m6A_region_miCLIP[, .N, by = .(m6A_region)]
+
+head(mouse_m6A$m6A_region_miCLIP)
+
+```
+
+```{r m6A_region_GLORI}
+
+mouse_m6A <-
+  within(mouse_m6A, {
+    m6A_region_GLORI <-
+      setnames(as.data.table(drach.tx), "seqnames", "tx_name")[
+        , merge(.SD, txmodel[, .(tx_name, ensembl_gene_id)], "tx_name")
+      ][
+        , is_m6A_GLORI := glori_m6A_lvl > 0.1
+      ][
+        ( is_m6A_GLORI )
+      ][
+        , .(N_m6A = .N)
+        , by = .(ensembl_gene_id, region)
+      ][
+        , merge(canonical_transcripts, .SD, all.x = TRUE) ## we need all.x = TRUE to include genes without m6A
+      ][
+        , .(gene, region, N_m6A)
+      ][
+        , region := factor(region, levels = c("utr5", "cds", "utr3"))
+      ][
+        , dcast(.SD, gene ~ region, value.var = "N_m6A", fun.aggregate = sum, fill = 0)
+      ][
+        !is.na(gene) , !"NA"
+      ][
+        , m6A_region := ifelse(utr5+cds+utr3 == 0,
+                               "none",
+                               paste0(
+                                 ifelse(utr5 > 0, "utr5", ""),
+                                 ifelse(cds  > 0, "cds",  ""),
+                                 ifelse(utr3 > 0, "utr3", "")
+                               ))
+      ][
+        , m6A_region := factor(m6A_region, levels = c("none", "utr5", "utr5cds", "utr5cdsutr3", "cds", "cdsutr3", "utr3", "utr5utr3")) 
+      ][
+        
+      ]
+  })
+
+
+
+mouse_m6A$m6A_region_GLORI[, .N, by = .(m6A_region)]
+
+head(mouse_m6A$m6A_region_GLORI)
+
+```
+
+# Decay data
+
+```{r}
+
+mouse_m6A$decay <-
+  fread("~/exports/m6A_decay_ms_share/data/mESC_emetine_decay_rates/GSE248503_mESC_emetine_decay_rates.tsv.gz")
+
+head(mouse_m6A$decay)
+
+```
+
+```{r}
+
+mouse_m6A$decay_ke <-
+  fread("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE86336&format=file&file=GSE86336%5Fhalflife%5Fchanges%5FWTvsKO%2Etxt%2Egz")
+setnames(mouse_m6A$decay_ke, "#gene_id", "gene")
+
+head(mouse_m6A$decay_ke)
+
+```
+
+
+```{r}
+
+mouse_m6A$decayData <-
+  merge(mouse_m6A$decay,
+        mouse_m6A$decay_ke[, .(gene, ke_WT = decay_from_t12(`halflife_WT(h)`), ke_KO =  decay_from_t12(`halflife_KO(h)`))],
+        "gene", 
+        all = TRUE
+  )
+
+head(mouse_m6A$decayData)
+
+```
+
+```{r}
+
+mouse_m6A$decayData[
+  , ggplot(.SD, aes(x = shino_WT_CTL, y = ke_WT)) +
+    geom_point() +
+    geom_abline(intercept = 0, slope = 1, col = "blue") +
+        stat_poly_line(col = "red") +
+    stat_poly_eq(use_label("eq", "R2"), col = "red") +
+    labs (x = "This study", y = "Ke et al. 2017") +
+    coord_equal(xlim = c(0, 1.5), ylim = c(0, 1.5)) +
+    theme_bw() +
+    NULL
+]
+
+
+```
+
+
+# Figures
+
+## Region boxplot 
+```{r region_decay_boxplot_miCLIP, fig.width = 2, fig.height = 3}
+
+mouse_m6A$m6A_region_miCLIP[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+ # t12_from_decay(endogenous_293t_time) < 48 &
+    is.finite(t12_from_decay(shino_WT_CTL))
+][
+  , {
+    xlabs = c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    #labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = shino_WT_CTL
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+            stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.75 + c(0, 0.05, 0.1),
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      #theme(axis.text.x = element_text(size = 6)) +
+      coord_cartesian(ylim = c(0, 1)) +
+      NULL
+  }
+]
+
+ggsave("~/exports/m6A_decay_ms_share/region_decay_boxplot_miCLIP_mouse.pdf", width = 1.5, height = 4)
+
+```
+
+```{r}
+
+mouse_m6A$m6A_region_miCLIP[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+ # t12_from_decay(endogenous_293t_time) < 48 &
+    is.finite(t12_from_decay(shino_WT_CTL))
+][
+  m6A_region %in% names(c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR"))
+][
+  , .N, by = "m6A_region"
+]
+
+```
+
+```{r region_decay_boxplot_GLORI, fig.width = 2, fig.height = 3}
+
+mouse_m6A$m6A_region_GLORI[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+ # t12_from_decay(endogenous_293t_time) < 48 &
+    is.finite(t12_from_decay(shino_WT_CTL))
+][
+  , {
+    xlabs = c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    #labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = shino_WT_CTL
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+            stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.75 + c(0, 0.05, 0.1),
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      #theme(axis.text.x = element_text(size = 6)) +
+      coord_cartesian(ylim = c(0, 1)) +
+      NULL
+  }
+]
+
+ggsave("~/exports/m6A_decay_ms_share/region_decay_boxplot_GLORI_mouse.pdf", width = 1.5, height = 4)
+
+```
+
+```{r}
+
+mouse_m6A$m6A_region_GLORI[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+ # t12_from_decay(endogenous_293t_time) < 48 &
+    is.finite(t12_from_decay(shino_WT_CTL))
+][
+  m6A_region %in% names(c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR"))
+][
+  , .N, by = "m6A_region"
+]
+
+```
+
+## Region boxplot Ke
+
+```{r , fig.width = 2, fig.height = 3}
+
+mouse_m6A$m6A_region_miCLIP[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+ # t12_from_decay(endogenous_293t_time) < 48 &
+    is.finite(t12_from_decay(ke_WT))
+][
+  , {
+    xlabs = c("none" = "no\nm6A",  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS\n+\n3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = ke_WT
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.75 + c(0, 0.05, 0.1),
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      #theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+      theme(axis.text.x = element_text(size = 5)) +
+      coord_cartesian(ylim = c(0, 1)) +
+      NULL
+  }
+]
+
+```
+
+```{r , fig.width = 2, fig.height = 3}
+
+mouse_m6A$m6A_region_GLORI[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+  # t12_from_decay(endogenous_293t_time) < 48 &
+  is.finite(t12_from_decay(ke_WT))
+][
+  , {
+    xlabs = c("none" = "no\nm6A",  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS\n+\n3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = ke_WT
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+      ) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.75 + c(0, 0.05, 0.1),
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      #theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+      theme(axis.text.x = element_text(size = 5)) +
+      coord_cartesian(ylim = c(0, 1)) +
+      NULL
+  }
+]
+
+```
+
+```{r}
+mouse_m6A$m6A_region_miCLIP[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+  # t12_from_decay(endogenous_293t_time) < 48 &
+  is.finite(t12_from_decay(shino_WT_CTL))
+][
+  , melt(.SD, id.vars = c("gene", "m6A_region"), measure.vars  = names(mouse_m6A$decayData[, -1]), variable.name = "sample", value.name = "k" )
+][
+  , experiment := str_extract(sample, "ke|shino")
+][
+  , genotype  := factor(ifelse(grepl("KO", sample), "KO", "WT"), levels= c("WT", "KO"))
+][
+  , treatment := factor(ifelse(grepl("EMT", sample), "EMT", "mock"), levels= c("mock", "EMT"))
+][
+  is.finite(k)
+][
+  ,
+  # normalize to no m6A genes
+  {
+    norm_fact = .SD[m6A_region == "none", .(nf = median(k)), by = .(sample)]
+    merge(.SD, norm_fact, by = c("sample"))[,  k := k / nf ][, !"nf"][]
+  }
+][
+  experiment == "shino" & genotype == "WT"
+][
+  , {
+    xlabs = c("none" = "no\nm6A",  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS\n+\n3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    # labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = treatment,
+               y = k
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+      ) +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  2.5 + c(0:3)*0.06,
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      #theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+      #theme(axis.text.x = element_text(size = 8)) +
+      coord_cartesian(ylim = c(0, 3)) +
+      facet_nested( ~ genotype + m6A_region) +
+      NULL
+  }
+]
+```
+
+
+## Emetine
+
+```{r, fig.width = 3, fig.height = 4}
+
+mouse_m6A$m6A_region_miCLIP[
+  , merge(.SD, mouse_m6A$decayData, "gene")
+][
+  gene %in% mouse_m6A$canonical_transcripts$gene
+][
+  # t12_from_decay(endogenous_293t_time) < 48 &
+  is.finite(t12_from_decay(shino_WT_CTL))
+][
+  , melt(.SD, id.vars = c("gene", "m6A_region"), measure.vars  = names(mouse_m6A$decayData[, -1]), variable.name = "sample", value.name = "k" )
+][
+  , experiment := str_extract(sample, "ke|shino")
+][
+  , genotype  := factor(ifelse(grepl("KO", sample), "KO", "WT"), levels= c("WT", "KO"))
+][
+  , treatment := factor(ifelse(grepl("EMT", sample), "EMT", "mock"), levels= c("mock", "EMT"))
+][
+  ,
+  # normalize to no m6A genes
+  {
+    norm_fact = .SD[is.finite(k) & m6A_region == "none", .(nf = median(k)), by = .(sample)]
+    merge(.SD, norm_fact, by = c("sample"))[,  k := k / nf ][, !"nf"][]
+  }
+][
+  experiment == "shino" & ((genotype == "WT" ) | (genotype == "KO" & treatment == "mock"))
+][
+  genotype == "WT" & treatment == "mock" , condition := "WT CTRL"
+][
+  genotype == "WT" & treatment == "EMT" , condition := "WT + Emetine"
+][
+  genotype == "KO" & treatment == "mock" , condition := "Mettl14 KO"
+][
+  , condition := factor(condition, levels = c("WT CTRL", "WT + Emetine", "Mettl14 KO"))
+][
+  , {
+    xlabs = c("none" = "no\nm6A",  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS\n+\n3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    # labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = k
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+      ) +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  2.3 + c(0:3)*0.06,
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Relative decay rate") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      #theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+      theme(axis.text.x = element_text(size = 6)) +
+      coord_cartesian(ylim = c(0, 3)) +
+      facet_nested( ~  condition) +
+      NULL
+  }
+]
+
+ggsave("~/exports/m6A_decay_ms_share/region_decay_boxplot_miCLIP_mouse_emetine.pdf", width = 4, height = 4)
+
+```
+
+
