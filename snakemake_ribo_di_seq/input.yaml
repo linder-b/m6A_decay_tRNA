@@ -1,4 +1,4 @@
-
+# directory with fasetq files (not gzip compressed)
 data_dir: data
 # data type is "monosome" or "disome"
 data_type: disome 
