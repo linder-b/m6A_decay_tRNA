@@ -145,10 +145,10 @@ palval_sets = c(m6A     = "#FFDE0D",
 
 palval_queosine <-
   c("WT" = "grey40",
-    "QTRT1" = "#e3e3ff",
-    "QTRT2" = "#c2c2ff",
-    "QTGAL" = "#ffc7c7",
-    "QTMAN" = "#cbe5c3")
+    "QTRT1 KO" = "#e3e3ff",
+    "QTRT2 KO" = "#c2c2ff",
+    "QTGAL KO" = "#ffc7c7",
+    "QTMAN KO" = "#cbe5c3")
 
 ```
 
@@ -242,7 +242,7 @@ canonical_transcripts <-
   getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "transcript_is_canonical", "hgnc_symbol"),
         filters = "transcript_is_canonical",
         values = TRUE,
-        mart = useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl"))
+        mart = useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 113, verbose = TRUE))
 
 canonical_transcripts = as.data.table(canonical_transcripts)
 setnames(canonical_transcripts, "hgnc_symbol", "gene")
@@ -1070,6 +1070,8 @@ head(decay_druid)
 
 #### Bazzini lab
 
+1.  Wu, Q., Medina, S.G., Kushawah, G., DeVore, M.L., Castellano, L.A., Hand, J.M., Wright, M., and Bazzini, A.A. (2019). Translation affects mRNA stability in a codon-dependent manner in human cells. eLife 8, e45396. https://doi.org/10.7554/eLife.45396.
+
 ```{r wu_2019}
 require(org.Hs.eg.db)
 
@@ -1490,7 +1492,7 @@ mcm5s2U_riboseq_1 <-
                   file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/old_experiment/RPM_coverage/",
                   file_suffix = "_clipped_tr_nohrRNA_un_codon_Asite_offset_RPM_coverage.txt")
 ## normalize
-with(mcm5s2U_riboseq_1, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
+with(mcm5s2U_riboseq_1, copy(coverage)[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
 mcm5s2U_riboseq_1$coverage <-
   copy(mcm5s2U_riboseq_1$coverage)
@@ -1509,7 +1511,7 @@ mcm5s2U_riboseq_2 <-
                   file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/new_experiment/RPM_coverage/",
                   file_suffix = "_Mono_clpd_tr_no_r_t_sno_sn_RNA_codon_Asite_offset_RPM_coverage.txt")
 ## normalize
-with(mcm5s2U_riboseq_2, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
+with(mcm5s2U_riboseq_2, copy(coverage)[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
 ## metadata
 mcm5s2U_riboseq_2$meta[, title := run]
@@ -1539,9 +1541,10 @@ mcm5s2U_riboseq$meta
 
 ```
 
-```{r lift coverage to codons}
+```{r lift mcm5s2U coverage to codons}
 
 mcols(cods.gr) = mcols(cods.gr)[! names(mcols(cods.gr)) %in% mcm5s2U_riboseq$meta$run]
+gc()
 
 mcols(cods.gr) <-
   cbind(mcols(cods.gr), as.data.table(cods.gr)[
@@ -1569,7 +1572,64 @@ gc()
 
 ```
 
+#### Queuosine riboseq
+
+From: 1. Zhao, X., Ma, D., Ishiguro, K., Saito, H., Akichika, S., Matsuzawa, I., Mito, M., Irie, T., Ishibashi, K., Wakabayashi, K., et al. (2023). Glycosylated queuosines in tRNAs optimize translational rate and post-embryonic growth. Cell 186, 5517–5535. https://doi.org/10.1016/j.cell.2023.10.026.
+
+```{r queuosine_riboseq}
+
+## read in data
+queuosine_riboseq <-
+  get_tx_coverage(experiment_name = "zhao",
+                  file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/queuosine/normalized/",
+                  file_suffix = "_coverage.txt")
+
+## metadata
+queuosine_riboseq$meta[, title := run]
+queuosine_riboseq$meta[, genotype  := factor(sedit(str_extract(title, "WT|QTRT1|QTRT2"), from = c("QTRT1", "QTRT2"), to = c("QTRT1 KO", "QTRT2 KO")), levels = c("WT", "QTRT1 KO", "QTRT2 KO")) ]
+queuosine_riboseq$meta[, replicate := str_extract(title, "[0-9]$") ]
+
+queuosine_riboseq
+
+```
+
+```{r lift queuosine coverage to codons}
+
+mcols(cods.gr) = mcols(cods.gr)[! names(mcols(cods.gr)) %in% queuosine_riboseq$meta$run]
+gc()
+
+mcols(cods.gr) <-
+  cbind(mcols(cods.gr), as.data.table(cods.gr)[
+    , codonID := paste0(gsub("\\..*$", "", seqnames), "_",codon_rank)
+  ][][
+    , merge(.SD, queuosine_riboseq$coverage[, codonID := paste0(ensembl_transcript_id, "_", codon_rank)][
+      , c("codonID", queuosine_riboseq$meta$run)
+      , with = FALSE
+    ], "codonID", all.x = TRUE, sort = FALSE) 
+  ][
+    , queuosine_riboseq$meta$run
+    , with = FALSE
+  ])
+
+## set NA coverage to 0
+for(run in queuosine_riboseq$meta$run) {
+  mcols(cods.gr)[run][which(is.na(mcols(cods.gr)[run])),] = 0
+}
+
+cods.gr
+
+## remove coverage data to free up RAM
+queuosine_riboseq$coverage = NULL
+gc()
+
+```
+
 # Paper figures
+
+```{r}
+stop()
+```
+
 
 ## m6A position effect
 
@@ -2331,7 +2391,7 @@ pl.scatter <-
       
       #stat_poly_line(aes(y= t12_from_decay(`mock`)), col = palval_genotype[["mock"]], se = FALSE, linetype = 2) +
       #stat_poly_line(aes(y= t12_from_decay(`emetine`)), col = palval_genotype[["emetine"]], se = FALSE, linetype = 2) +
-      geom_label_npc(label = "emetine", npcx = 0.95, npcy = 0.95) +
+      geom_label_npc(label = "Emetine", npcx = 0.95, npcy = 0.95) +
       scale_y_continuous(trans = "log10", breaks = c(0.75, 1.5, 3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
       ## style
      # coord_cartesian(ylim = c(6, 60)) +
@@ -2452,7 +2512,7 @@ pl.scatter <-
       
       #stat_poly_line(aes(y= t12_from_decay(`mock`)), col = palval_genotype[["mock"]], se = FALSE, linetype = 2) +
       #stat_poly_line(aes(y= t12_from_decay(`emetine`)), col = palval_genotype[["emetine"]], se = FALSE, linetype = 2) +
-      geom_label_npc(label = "emetine", npcx = 0.95, npcy = 0.95) +
+      geom_label_npc(label = "Emetine", npcx = 0.95, npcy = 0.95) +
       scale_y_continuous(trans = "log10", breaks = c(0.75, 1.5, 3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
       ## style
      # coord_cartesian(ylim = c(6, 60)) +
@@ -2487,7 +2547,7 @@ pl.bar <-
       theme_bw() +
       theme(legend.position = "none") +
       labs(x = expression(m^6*A~"level [A.U.]"),
-           y = expression("log2FC")
+           y = expression(Log[2]*FC)
       )
     ]
 
@@ -2632,7 +2692,6 @@ as.data.table(cods.gr)[
  genotype == "WT" 
 ][
   , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = treatment)) +
-    
     stat_summary(fun.data = mean_se) +
     stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
     stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
@@ -2640,12 +2699,14 @@ as.data.table(cods.gr)[
                    ifelse(
                      r.squared < 0.1,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2<0.01")
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
                      ,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2~`=`~", round(r.squared, 2)))
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
                  )),
                  output.type = "numeric",
                  parse = TRUE,
@@ -2697,12 +2758,14 @@ as.data.table(cods.gr)[
                    ifelse(
                      r.squared < 0.1,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2<0.01")
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
                      ,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2~`=`~", round(r.squared, 2)))
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
                  )),
                  output.type = "numeric",
                  parse = TRUE,
@@ -2761,12 +2824,14 @@ as.data.table(cods.gr)[
                    ifelse(
                      r.squared < 0.1,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2<0.01")
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
                      ,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2~`=`~", round(r.squared, 2)))
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
                  )),
                  output.type = "numeric",
                  parse = TRUE,
@@ -2814,18 +2879,20 @@ as.data.table(cods.gr)[
   , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = genotype)) +
     
     stat_summary(fun.data = mean_se) +
-    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(1, length(levels(gloribin)))]  ] ) +
-    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(1, length(levels(gloribin)))]  ],
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
                  aes(label = after_stat(
                    ifelse(
                      r.squared < 0.1,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2<0.01")
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
                      ,
                      paste0(
-                     "m~`=`~", round(b_1, 2),
-                     "*`,`~italic(R)^2~`=`~", round(r.squared, 2)))
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
                  )),
                  output.type = "numeric",
                  parse = TRUE,
@@ -2833,7 +2900,7 @@ as.data.table(cods.gr)[
     ) +
     scale_color_manual(values = palval_genotype ) +
     
-    facet_nested(codon ~  experiment + treatment, scale = "free_y",  labeller = labeller(treatment = c("CTRL" = "mock", "STM" = "STM2457"))) +
+    facet_nested(codon ~  treatment, scale = "free_y",  labeller = labeller(treatment = c("CTRL" = "mock", "STM" = "STM2457"))) +
     
     theme_bw() +
     labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
@@ -3041,7 +3108,7 @@ qpcr_data_complete[
                   aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.11) +
     scale_shape_manual(values= c(1:3,5:20)) +
     scale_color_manual(values = palval_reporter) +
-    facet_nested( ~ txn_inh , scales = "free_y", labeller = labeller(txn_inh = c("ActD" = "actinomycin D", "TLD"="triptolide") ) )  +
+    facet_nested( ~ txn_inh , scales = "free_y", labeller = labeller(txn_inh = c("ActD" = "Actinomycin D", "TLD"="Triptolide") ) )  +
     theme_bw() +
     coord_cartesian(ylim = c(0, 1.3)) +
     theme(legend.position = "none") +
@@ -3565,7 +3632,7 @@ pl.bar <-
       theme_bw() +
       theme(legend.position = "none") +
       labs(x = expression(m^6*A~"level [A.U.]"),
-           y = expression("log2FC")
+           y = expression(Log[2]*FC)
       )
     ]
 
@@ -3673,7 +3740,7 @@ plotdat[
          theme_bw() +
          theme(legend.position = "none") +
          labs(x = expression(m^6*A~"level [A.U.]"),
-              y = expression("log2FC")
+              y = expression(Log[2]*FC)
          )
        
        
@@ -3911,7 +3978,7 @@ pl.bar <-
               theme_bw() +
               theme(legend.position = "none") +
               labs(x = expression(m^6*A~"level [A.U.]"),
-                   y = expression("log2FC")
+                   y = expression(Log[2]*FC)
               )]
   
 
@@ -4044,7 +4111,7 @@ pl.bar <-
               theme_bw() +
               theme(legend.position = "none") +
               labs(x = expression(m^6*A~"level [A.U.]"),
-                   y = expression("log2FC")
+                   y = expression(Log[2]*FC)
               )]
   
 
@@ -4116,6 +4183,65 @@ as.data.table(drach.tx)[
 ggsave("~/exports/m6A_decay_ms_share/gloribin_mcm5s2U_STM.pdf", width = 6, height = 3)
 
 ```
+
+## Queuosine
+
+```{r queuosine_GLORI, fig.width = 4, fig.height = 3}
+
+as.data.table(cods.gr)[
+  codon %in% c("GAC", "AAC")
+][
+  , ensembl_transcript_id := gsub("\\..*", "", seqnames)
+][
+  , gene := setkeyv(canonical_transcripts[, .(ensembl_transcript_id, gene)], "ensembl_transcript_id")[ensembl_transcript_id, gene]
+][
+ ensembl_transcript_id %in%  new_filter
+][
+  , melt(.SD, id.vars=c("codon", "gloribin", "glori_m6A_lvl"), measure.vars = queuosine_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(gloribin, codon, run)
+][
+  , c("experiment", "genotype", "replicate")  := setkeyv(queuosine_riboseq$meta, "run")[run, .(experiment, genotype, replicate) ]
+][
+  
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = genotype)) +
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ], se = FALSE ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                       "m~`=`~", round(b_1, 2)
+                       #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                       "m~`=`~", round(b_1, 2)
+                       #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+    scale_color_manual(values = palval_queosine ) +
+    facet_nested( ~ codon ) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    #scale_x_continuous(limits = c(0,1)) +
+    #geom_vline(aes(xintercept = 0.05), linetype = 2) +
+    NULL
+]
+
+ggsave("~/exports/m6A_decay_ms_share/queuosine_GLORI.pdf", width = 4, height = 3)
+
+```
+
 
 
 
