@@ -406,7 +406,7 @@ ggplot(exlenTabGene, aes(x = exlen)) +
   theme(plot.title = element_text(hjust = 0.5), legend.position=c(0.7, 0.6)) +
   NULL
 
- fwrite(exlenTabGene, "/mnt/c/Users/linde/Nextcloud/inbox/exports/exlen_human.tsv", sep = "\t")
+ fwrite(exlenTabGene, "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/exlen_human.tsv", sep = "\t")
 
 ```
 
@@ -612,7 +612,9 @@ genes_histones = grep("^H", msigList$GOCC_DNA_PACKAGING_COMPLEX, value = TRUE)
 
 # Data
 
-Collect data from various sources. \## --- m6A sites --- \### miCLIP Read in the BED file of DRACH sites called by the miCLIP pipeline in analysis_miCLIP.Rmd
+Collect data from various sources.
+## --- m6A sites --- 
+### miCLIP Read in the BED file of DRACH sites called by the miCLIP pipeline in analysis_miCLIP.Rmd
 
 ```{r read c2t}
 
@@ -990,7 +992,7 @@ mcm5s2U_SLAM <-
     
     ## define outlier runs
     # outliers = meta[title == "WT_200IAA", run]
-    outliers = c("CTU2_2h_B", "FTSJ1_1h_B")
+    outliers = c("CTU2_2h_B")
     # outliers = c("")
     
     tpm <-
@@ -1446,10 +1448,14 @@ qpcr_data_complete[
 
 ## --- Ribosome profiling ---
 
+```{r}
+## Set the method to merge genes with ribosome profiling coverage within experiment. Use either "union" or "intersect".
+gene_coverag_merge_mode = "union" 
+```
+
 #### mcm5s2U riboseq
 
 ```{r mcm5s2U_riboseq}
-
 
 ## function for reading Jie's files
 read_tx_coverage <-
@@ -1464,21 +1470,33 @@ read_tx_coverage <-
 
 ## wrapper to get coverage objects
 get_tx_coverage <-
-  function(experiment_name, file_path, file_suffix){
+  function(experiment_name, file_path, file_suffix, combine = "intersect"){
     
     coverage_files = list.files(path = file_path, pattern = file_suffix, full.names = TRUE)
-    if(length(coverage_files) == 0){stop("No files found!")}else(cat(paste("Reading", length(coverage_files), "files.")))
+    if(length(coverage_files) == 0){stop("No files found!")}else(cat(paste("Reading", length(coverage_files), "files.\n")))
+    
+    ## define combine method
+    if(combine == "union"){
+      cat("Using union for gene merging.\n")
+      use_all = FALSE
+    }else if(combine == "intersect"){
+      cat("Using intersection for gene merging.\n")
+      use_all = TRUE
+    }else{
+      cat("Error: Undefined method for gene merging. Use 'union' or 'intersect'. \n")
+      stop()
+    }
     
     ## read in data
     coverage <-
       foreach(coverage_file = coverage_files,
-              .combine = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = TRUE)}) %do% {
+              .combine = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = use_all)}) %do% {
                 read_tx_coverage(coverage_file, file_suffix)
               }
     
     meta <-
       data.table(experiment = experiment_name, run = setdiff(names(coverage), c("ensembl_transcript_id", "cds_len_cods", "codon_rank")) )
-      
+    
     
     return(list(file_suffix = file_suffix, coverage = coverage, meta = meta))
     
@@ -1489,13 +1507,11 @@ get_tx_coverage <-
 ## read in data
 mcm5s2U_riboseq_1 <-
   get_tx_coverage(experiment_name = "exp1",
-                  file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/old_experiment/RPM_coverage/",
-                  file_suffix = "_clipped_tr_nohrRNA_un_codon_Asite_offset_RPM_coverage.txt")
-## normalize
-with(mcm5s2U_riboseq_1, copy(coverage)[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
-
-mcm5s2U_riboseq_1$coverage <-
-  copy(mcm5s2U_riboseq_1$coverage)
+                  file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/old_experiment/RPM_coverage/",
+                  file_suffix = "_clipped_tr_nohrRNA_un_codon_Asite_offset_RPM_coverage.txt",
+                  combine = gene_coverag_merge_mode)
+## normalize in place
+with(mcm5s2U_riboseq_1, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
 ## metadata
 mcm5s2U_riboseq_1$meta[, title := run]
@@ -1508,10 +1524,11 @@ mcm5s2U_riboseq_1$meta[, replicate := str_extract(title, "[0-9]$") ]
 ## read in data
 mcm5s2U_riboseq_2 <-
   get_tx_coverage(experiment_name = "exp2",
-                  file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/new_experiment/RPM_coverage/",
-                  file_suffix = "_Mono_clpd_tr_no_r_t_sno_sn_RNA_codon_Asite_offset_RPM_coverage.txt")
-## normalize
-with(mcm5s2U_riboseq_2, copy(coverage)[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
+                  file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/new_experiment/RPM_coverage/",
+                  file_suffix = "_Mono_clpd_tr_no_r_t_sno_sn_RNA_codon_Asite_offset_RPM_coverage.txt",
+                  combine = gene_coverag_merge_mode)
+## normalize in place
+with(mcm5s2U_riboseq_2, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
 ## metadata
 mcm5s2U_riboseq_2$meta[, title := run]
@@ -1581,8 +1598,9 @@ From: 1. Zhao, X., Ma, D., Ishiguro, K., Saito, H., Akichika, S., Matsuzawa, I.,
 ## read in data
 queuosine_riboseq <-
   get_tx_coverage(experiment_name = "zhao",
-                  file_path = "/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/queuosine/normalized/",
-                  file_suffix = "_coverage.txt")
+                  file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/queuosine/normalized/",
+                  file_suffix = "_coverage.txt",
+                  combine = gene_coverag_merge_mode)
 
 ## metadata
 queuosine_riboseq$meta[, title := run]
@@ -1627,7 +1645,7 @@ gc()
 # Paper figures
 
 ```{r}
-stop()
+#stop()
 ```
 
 
@@ -3009,7 +3027,7 @@ p <-
 
 ## scaled facets from: https://stackoverflow.com/a/61127086
 p + 
-  facet_nested(~ codon_tRNA_mod + codon, scales ="free_x", space = "free", labeller = labeller(codon)) +
+  facet_nested(~ codon_tRNA_mod , scales ="free_x", space = "free") +
   stat_summary(fun.data = mean_se, size = 0.25, position = position_dodge(width = 0.75)) + 
    ggforce::facet_row( ~ codon_tRNA_mod  , scales = "free", space = "free") +
    theme(panel.spacing.x = unit( 0 , units = "lines") ) +
@@ -3050,7 +3068,7 @@ qpcr_data_complete[
     NULL
 ]
   
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock.pdf"), width = 2, height = 2, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock.pdf"), width = 2, height = 2, units = "in")
 
 ```
 
@@ -3083,7 +3101,7 @@ qpcr_data_complete[
     NULL
 ]
   
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock_TLD.pdf"), width = 2, height = 2, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock_TLD.pdf"), width = 2, height = 2, units = "in")
 
 ```
 
@@ -3116,7 +3134,7 @@ qpcr_data_complete[
     NULL
 ]
   
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock2.pdf"), width = 2.5, height = 2, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_mock2.pdf"), width = 2.5, height = 2, units = "in")
 
 ```
 
@@ -3156,7 +3174,7 @@ qpcr_data_complete[
     NULL
 ]
 
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_STM2.pdf"), width = 4, height = 2, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_STM2.pdf"), width = 4, height = 2, units = "in")
 
 ```
 
@@ -3196,7 +3214,7 @@ qpcr_data_complete[
     NULL
 ]
 
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_TLD.pdf"), width = 4, height = 2, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_TLD.pdf"), width = 4, height = 2, units = "in")
 
 ```
 
@@ -3311,7 +3329,7 @@ qpcr_data_complete[
     NULL
 ]
 
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_EM2.pdf"), width = 3, height = 2.5, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_EM2.pdf"), width = 3, height = 2.5, units = "in")
 
 ```
 
@@ -3353,7 +3371,7 @@ qpcr_data_complete[
     NULL
 ]
 
-ggsave(paste0("/mnt/c/Users/linde/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_CHX2.pdf"), width = 3, height = 2.5, units = "in")
+ggsave(paste0("/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/DRACH_reporter_CHX2.pdf"), width = 3, height = 2.5, units = "in")
 
 ```
 
@@ -4194,8 +4212,6 @@ as.data.table(cods.gr)[
   , ensembl_transcript_id := gsub("\\..*", "", seqnames)
 ][
   , gene := setkeyv(canonical_transcripts[, .(ensembl_transcript_id, gene)], "ensembl_transcript_id")[ensembl_transcript_id, gene]
-][
- ensembl_transcript_id %in%  new_filter
 ][
   , melt(.SD, id.vars=c("codon", "gloribin", "glori_m6A_lvl"), measure.vars = queuosine_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
 ][
