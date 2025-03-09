@@ -1,6 +1,9 @@
 # Results directory
 results/
 
+# Snakemake tempdir
+.snakemake/
+
 # History files
 .Rhistory
 .Rapp.history
