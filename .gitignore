@@ -1,5 +1,6 @@
 # Results directory
 results/
+logs/
 
 # Snakemake tempdir
 .snakemake/
