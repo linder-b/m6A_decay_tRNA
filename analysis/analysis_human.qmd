@@ -230,6 +230,62 @@ geom_decay_text <-
                          round(t12, 1), "*h"), vjust = vj*1.05 ), x = Inf, y = Inf, hjust = 1, parse = TRUE, show.legend = FALSE, size = size)
   }
 
+
+## function for reading Jie's riboseq coverage files
+read_tx_coverage <-
+  function(coverage_file, file_suffix){
+    data <-
+      fread(coverage_file, sep = "\t", sep2 = ",", header = FALSE)[
+        , .(codon_rank = as.integer(1:(V2+1)), coverage = as.numeric(str_split_1(V3, ",")) )
+        , by = .(ensembl_transcript_id = str_split_i(V1, "\\|", 2), cds_len_cods = V2 )]
+    setnames(data, "coverage", gsub(file_suffix, "", basename(coverage_file)))
+    setnames(data, gsub("^PSLib[0-9]+_RPF_", "", names(data)))
+  }
+
+## wrapper to get coverage objects
+get_tx_coverage <-
+  function(experiment_name, file_path, file_suffix, combine = "intersect"){
+    
+    coverage_files = list.files(path = file_path, pattern = file_suffix, full.names = TRUE)
+    if(length(coverage_files) == 0){stop("No files found!")}else(cat(paste("Reading", length(coverage_files), "files.\n")))
+
+    ## read in data
+    coverage <-
+      foreach(coverage_file = coverage_files) %do% {
+        read_tx_coverage(coverage_file, file_suffix)
+      }
+    
+    ## track how many genes have coverage
+    coverage_genes <-
+      lapply(coverage, function(x){x[, unique(ensembl_transcript_id) ]})
+    names(coverage_genes) = gsub(file_suffix, "", basename(coverage_files))
+    
+    ## define combine method
+    if(combine == "union"){
+      cat("Using union for gene merging.\n")
+      coverage <-
+        Reduce(f = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = TRUE)}, x = coverage)
+    }else if(combine == "intersect"){
+      cat("Using intersection for gene merging.\n")
+      coverage <-
+        Reduce(f = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = FALSE)}, x = coverage)
+    }else{
+      cat("Error: Undefined method for gene merging. Use 'union' or 'intersect'. \n")
+      stop()
+    }
+    
+
+
+    meta <-
+      data.table(experiment = experiment_name, run = setdiff(names(coverage), c("ensembl_transcript_id", "cds_len_cods", "codon_rank")) )
+    
+    
+    return(list(file_suffix = file_suffix, coverage = coverage, coverage_genes = coverage_genes, meta = meta))
+    
+  }
+
+
+
 ```
 
 # Transcript model
@@ -1448,60 +1504,9 @@ qpcr_data_complete[
 
 ## --- Ribosome profiling ---
 
-```{r}
-## Set the method to merge genes with ribosome profiling coverage within experiment. Use either "union" or "intersect".
-gene_coverag_merge_mode = "union" 
-```
-
 #### mcm5s2U riboseq
 
 ```{r mcm5s2U_riboseq}
-
-## function for reading Jie's files
-read_tx_coverage <-
-  function(coverage_file, file_suffix){
-    data <-
-      fread(coverage_file, sep = "\t", sep2 = ",", header = FALSE)[
-        , .(codon_rank = as.integer(1:(V2+1)), coverage = as.numeric(str_split_1(V3, ",")) )
-        , by = .(ensembl_transcript_id = str_split_i(V1, "\\|", 2), cds_len_cods = V2 )]
-    setnames(data, "coverage", gsub(file_suffix, "", basename(coverage_file)))
-    setnames(data, gsub("^PSLib[0-9]+_RPF_", "", names(data)))
-  }
-
-## wrapper to get coverage objects
-get_tx_coverage <-
-  function(experiment_name, file_path, file_suffix, combine = "intersect"){
-    
-    coverage_files = list.files(path = file_path, pattern = file_suffix, full.names = TRUE)
-    if(length(coverage_files) == 0){stop("No files found!")}else(cat(paste("Reading", length(coverage_files), "files.\n")))
-    
-    ## define combine method
-    if(combine == "union"){
-      cat("Using union for gene merging.\n")
-      use_all = FALSE
-    }else if(combine == "intersect"){
-      cat("Using intersection for gene merging.\n")
-      use_all = TRUE
-    }else{
-      cat("Error: Undefined method for gene merging. Use 'union' or 'intersect'. \n")
-      stop()
-    }
-    
-    ## read in data
-    coverage <-
-      foreach(coverage_file = coverage_files,
-              .combine = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = use_all)}) %do% {
-                read_tx_coverage(coverage_file, file_suffix)
-              }
-    
-    meta <-
-      data.table(experiment = experiment_name, run = setdiff(names(coverage), c("ensembl_transcript_id", "cds_len_cods", "codon_rank")) )
-    
-    
-    return(list(file_suffix = file_suffix, coverage = coverage, meta = meta))
-    
-  }
-
 
 # mcm5s2U_riboseq experiment 1
 ## read in data
@@ -1509,7 +1514,7 @@ mcm5s2U_riboseq_1 <-
   get_tx_coverage(experiment_name = "exp1",
                   file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/old_experiment/RPM_coverage/",
                   file_suffix = "_clipped_tr_nohrRNA_un_codon_Asite_offset_RPM_coverage.txt",
-                  combine = gene_coverag_merge_mode)
+                  combine = "union")
 ## normalize in place
 with(mcm5s2U_riboseq_1, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
@@ -1526,7 +1531,7 @@ mcm5s2U_riboseq_2 <-
   get_tx_coverage(experiment_name = "exp2",
                   file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/new_experiment/RPM_coverage/",
                   file_suffix = "_Mono_clpd_tr_no_r_t_sno_sn_RNA_codon_Asite_offset_RPM_coverage.txt",
-                  combine = gene_coverag_merge_mode)
+                  combine = "union")
 ## normalize in place
 with(mcm5s2U_riboseq_2, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
 
@@ -1600,7 +1605,7 @@ queuosine_riboseq <-
   get_tx_coverage(experiment_name = "zhao",
                   file_path = "/mnt/c/Users/BastianLinder/Nextcloud/inbox/exports/m6A_decay_ms_share/RP_coverage/queuosine/normalized/",
                   file_suffix = "_coverage.txt",
-                  combine = gene_coverag_merge_mode)
+                  combine = "intersect")
 
 ## metadata
 queuosine_riboseq$meta[, title := run]
@@ -1610,6 +1615,13 @@ queuosine_riboseq$meta[, replicate := str_extract(title, "[0-9]$") ]
 queuosine_riboseq
 
 ```
+
+```{r}
+
+vennr::vennr(queuosine_riboseq$coverage_genes)
+
+```
+
 
 ```{r lift queuosine coverage to codons}
 
@@ -1643,11 +1655,6 @@ gc()
 ```
 
 # Paper figures
-
-```{r}
-#stop()
-```
-
 
 ## m6A position effect
 
@@ -4210,6 +4217,8 @@ as.data.table(cods.gr)[
   codon %in% c("GAC", "AAC")
 ][
   , ensembl_transcript_id := gsub("\\..*", "", seqnames)
+][
+  ensembl_transcript_id %in%  Reduce(intersect, queuosine_riboseq$coverage_genes) ## we only look at genes with coverage in all datasets
 ][
   , gene := setkeyv(canonical_transcripts[, .(ensembl_transcript_id, gene)], "ensembl_transcript_id")[ensembl_transcript_id, gene]
 ][
