@@ -4218,9 +4218,8 @@ as.data.table(cods.gr)[
 ][
   , ensembl_transcript_id := gsub("\\..*", "", seqnames)
 ][
-  ensembl_transcript_id %in%  Reduce(intersect, queuosine_riboseq$coverage_genes) ## we only look at genes with coverage in all datasets
-][
-  , gene := setkeyv(canonical_transcripts[, .(ensembl_transcript_id, gene)], "ensembl_transcript_id")[ensembl_transcript_id, gene]
+  ## we only look at genes with coverage in all datasets
+  ensembl_transcript_id %in%  Reduce(intersect, queuosine_riboseq$coverage_genes) 
 ][
   , melt(.SD, id.vars=c("codon", "gloribin", "glori_m6A_lvl"), measure.vars = queuosine_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
 ][
