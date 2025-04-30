@@ -1,0 +1,8 @@
+name: sm_kallisto
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - kallisto

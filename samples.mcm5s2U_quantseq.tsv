@@ -1,0 +1,19 @@
+experiment	run	title	layout	type	species	spikein	read1	read2	source
+mcm5s2U_quantseq	CTU2_0h_A	CTU2_0h_A	SINGLE	slamseq	homo_sapiens		CTU2_0h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_0h_B	CTU2_0h_B	SINGLE	slamseq	homo_sapiens		CTU2_0h_B.fastq.gz
+mcm5s2U_quantseq	CTU2_1h_A	CTU2_1h_A	SINGLE	slamseq	homo_sapiens		CTU2_1h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_1h_B	CTU2_1h_B	SINGLE	slamseq	homo_sapiens		CTU2_1h_B.fastq.gz
+mcm5s2U_quantseq	CTU2_2h_A	CTU2_2h_A	SINGLE	slamseq	homo_sapiens		CTU2_2h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_2h_B	CTU2_2h_B	SINGLE	slamseq	homo_sapiens		CTU2_2h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_0h_A	ELP1_0h_A	SINGLE	slamseq	homo_sapiens		ELP1_0h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_0h_B	ELP1_0h_B	SINGLE	slamseq	homo_sapiens		ELP1_0h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_1h_A	ELP1_1h_A	SINGLE	slamseq	homo_sapiens		ELP1_1h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_1h_B	ELP1_1h_B	SINGLE	slamseq	homo_sapiens		ELP1_1h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_2h_A	ELP1_2h_A	SINGLE	slamseq	homo_sapiens		ELP1_2h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_2h_B	ELP1_2h_B	SINGLE	slamseq	homo_sapiens		ELP1_2h_B.fastq.gz
+mcm5s2U_quantseq	WT_0h_A	WT_0h_A	SINGLE	slamseq	homo_sapiens		WT_0h_A.fastq.gz
+mcm5s2U_quantseq	WT_0h_B	WT_0h_B	SINGLE	slamseq	homo_sapiens		WT_0h_B.fastq.gz
+mcm5s2U_quantseq	WT_1h_A	WT_1h_A	SINGLE	slamseq	homo_sapiens		WT_1h_A.fastq.gz
+mcm5s2U_quantseq	WT_1h_B	WT_1h_B	SINGLE	slamseq	homo_sapiens		WT_1h_B.fastq.gz
+mcm5s2U_quantseq	WT_2h_A	WT_2h_A	SINGLE	slamseq	homo_sapiens		WT_2h_A.fastq.gz
+mcm5s2U_quantseq	WT_2h_B	WT_2h_B	SINGLE	slamseq	homo_sapiens		WT_2h_B.fastq.gz

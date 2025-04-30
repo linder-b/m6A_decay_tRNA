@@ -1,0 +1,12 @@
+name: sm_gedi
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - openjdk
+  - R
+  - r-ggplot2
+  - r-reshape2
+  - r-data.table

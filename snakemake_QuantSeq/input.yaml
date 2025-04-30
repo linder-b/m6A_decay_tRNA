@@ -1,0 +1,9 @@
+# directory with fasetq files (not gzip compressed)
+data_dir: data
+adapter_seq: AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+# parameters for runing STAR mapping
+STAR_params: --outFilterMultimapNmax 10 --outFilterType BySJout --outFilterMismatchNoverReadLmax 0.05  --outSAMtype BAM SortedByCoordinate --quantMode GeneCounts  --limitBAMsortRAM 50000000000
+# Index for STAR mapping
+STAR_index: /nfs/home/jwu/u34_project/actd_20230928/Jie_analysis/genome/STAR_human_yeast_merged_index
+
+

@@ -1,0 +1,27 @@
+experiment	run	title	layout	type	species	spikein	read1	read2	source
+miCLIP	miCLIP	miCLIP	PAIRED	miclip	homo_sapiens		miCLIP_1.fastq.gz	miCLIP_2.fastq.gz	ENA
+NatMeth	SRR2003406	HEK293_total_RNA_miCLIP_SySy	SINGLE	miclip	homo_sapiens		SRR2003406.fastq.gz		ENA
+NatMeth	SRR1686787	HEK293_total_RNA_miCLIP_Abcam	SINGLE	miclip	homo_sapiens		SRR1686787.fastq.gz		ENA
+NatMeth	SRR1686788	HEK293_mRNA_miCLIP_rep1	PAIRED	miclip	homo_sapiens		SRR1686788_1.fastq.gz	SRR1686788_2.fastq.gz	ENA
+NatMeth	SRR1686789	HEK293_mRNA_miCLIP_rep2	PAIRED	miclip	homo_sapiens		SRR1686789_1.fastq.gz	SRR1686789_2.fastq.gz	ENA
+NatMeth	SRR1686790	HEK293_mRNA_miCLIP_rep3	PAIRED	miclip	homo_sapiens		SRR1686790_1.fastq.gz	SRR1686790_2.fastq.gz	ENA
+NatMeth	SRR1686791	HEK293_mRNA_mICLIP_rep4	PAIRED	miclip	homo_sapiens		SRR1686791_1.fastq.gz	SRR1686791_2.fastq.gz	ENA
+Mauer_et_al	SRR3176281	miCLIP_of_HEK293T	SINGLE	miclip	homo_sapiens		SRR3176281.fastq.gz		ENA
+mcm5s2U_quantseq	CTU2_0h_A	CTU2_0h_A	SINGLE	slamseq	homo_sapiens		CTU2_0h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_0h_B	CTU2_0h_B	SINGLE	slamseq	homo_sapiens		CTU2_0h_B.fastq.gz
+mcm5s2U_quantseq	CTU2_1h_A	CTU2_1h_A	SINGLE	slamseq	homo_sapiens		CTU2_1h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_1h_B	CTU2_1h_B	SINGLE	slamseq	homo_sapiens		CTU2_1h_B.fastq.gz
+mcm5s2U_quantseq	CTU2_2h_A	CTU2_2h_A	SINGLE	slamseq	homo_sapiens		CTU2_2h_A.fastq.gz
+mcm5s2U_quantseq	CTU2_2h_B	CTU2_2h_B	SINGLE	slamseq	homo_sapiens		CTU2_2h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_0h_A	ELP1_0h_A	SINGLE	slamseq	homo_sapiens		ELP1_0h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_0h_B	ELP1_0h_B	SINGLE	slamseq	homo_sapiens		ELP1_0h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_1h_A	ELP1_1h_A	SINGLE	slamseq	homo_sapiens		ELP1_1h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_1h_B	ELP1_1h_B	SINGLE	slamseq	homo_sapiens		ELP1_1h_B.fastq.gz
+mcm5s2U_quantseq	ELP1_2h_A	ELP1_2h_A	SINGLE	slamseq	homo_sapiens		ELP1_2h_A.fastq.gz
+mcm5s2U_quantseq	ELP1_2h_B	ELP1_2h_B	SINGLE	slamseq	homo_sapiens		ELP1_2h_B.fastq.gz
+mcm5s2U_quantseq	WT_0h_A	WT_0h_A	SINGLE	slamseq	homo_sapiens		WT_0h_A.fastq.gz
+mcm5s2U_quantseq	WT_0h_B	WT_0h_B	SINGLE	slamseq	homo_sapiens		WT_0h_B.fastq.gz
+mcm5s2U_quantseq	WT_1h_A	WT_1h_A	SINGLE	slamseq	homo_sapiens		WT_1h_A.fastq.gz
+mcm5s2U_quantseq	WT_1h_B	WT_1h_B	SINGLE	slamseq	homo_sapiens		WT_1h_B.fastq.gz
+mcm5s2U_quantseq	WT_2h_A	WT_2h_A	SINGLE	slamseq	homo_sapiens		WT_2h_A.fastq.gz
+mcm5s2U_quantseq	WT_2h_B	WT_2h_B	SINGLE	slamseq	homo_sapiens		WT_2h_B.fastq.gz

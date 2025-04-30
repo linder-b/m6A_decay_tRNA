@@ -1,0 +1,608 @@
+---
+title: "m6A-mediated decay: analsis of cancer data"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+
+```{r setup}
+options(bitmapType = "cairo") ## from: https://support.rstudio.com/hc/en-us/community/posts/200636648/comments/201139568
+
+############
+analysisID = "m6A_decay_tRNA"
+############
+
+suppressPackageStartupMessages({
+  ## general tools
+  library(Hmisc)
+  library(tidyverse)
+  library(data.table)
+  library(doParallel)
+  library(stringr)
+  library(readxl)
+  
+  ## plot functions
+  library(ggpubr)
+  library(ggrepel)
+  library(ggbeeswarm)
+  library(RColorBrewer)
+  #library(colorspace)
+  #require(GGally)
+  #library(corrplot)
+  
+  ## general genomic
+  library(rtracklayer)
+  library(GenomicFeatures)
+  library(SummarizedExperiment)
+  library(GEOquery)
+  library(biomaRt)
+  
+  ## script specific functions
+  # source("~/projectR/m6A/functions/helper_functions.R")
+  # source("~/projectR/m6A/functions/tcga_functions.R")
+  # source("~/projectR/m6A/functions/signature_functions.R")
+  # source("~/projectR/m6A/functions/plot_functions.R")
+  #library("recount")
+  
+  ## TCGA
+  # library(cgdsr)
+  library(maftools)
+  library(TCGAbiolinks)
+  library(TCGAutils)
+  library(survminer)
+  library(riskRegression)
+})
+
+for(file in list.files("../R_codebase/", "*.R$", full.names = TRUE)){source(file)}
+
+###
+### output setup
+###
+
+tmpDir = file.path("/scratch/linder", analysisID)
+if(!dir.exists(tmpDir)){dir.create(tmpDir, recursive = T)}
+
+figDir = "../results/analysis_cancer/"
+if(!dir.exists(figDir)){dir.create(figDir, recursive = T)}
+
+```
+
+```{r canonical_transcripts}
+
+if(!exists("canonical_transcripts")){
+  
+  canonical_transcripts <- 
+    getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "transcript_is_canonical", "hgnc_symbol"),
+          filters = "transcript_is_canonical",
+          values = TRUE,
+          mart = useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl"))
+  
+  canonical_transcripts = as.data.table(canonical_transcripts)[isUnique(ensembl_gene_id)]
+  setnames(canonical_transcripts, "hgnc_symbol", "gene")
+  
+}
+
+head(canonical_transcripts)
+
+```
+
+# Data
+
+## mRNAsi stemness
+
+```{r mRNAsi_model}
+
+mRNAsi_model_file = file.path("~/exports/data/", "pcbc-stemsig.tsv")
+
+if(!file.exists(mRNAsi_model_file)){
+  ## get mRNAsi model coefficients
+  mRNAsi_model <-
+    calculate_mRNAsi_signature_coefficients(tmpDir = tmpDir, synapser_email = NULL, synapser_pwd = NULL, idtab = idtab)
+  write.table(mRNAsi_model, file = mRNAsi_model_file, sep = "\t", quote = FALSE, col.names = FALSE)
+} else {
+  mRNAsi_model <-
+    fread(mRNAsi_model_file)
+}
+
+mRNAsi_model
+
+```
+
+## METABRIC
+
+```{r}
+
+dataURL = "https://cbioportal-datahub.s3.amazonaws.com/brca_metabric.tar.gz"
+dataFile = file.path(tmpDir, basename(dataURL))
+
+
+```
+
+```{r metabric}
+# 
+# if(!exists("metabric")){metabric = list()}
+# 
+# registerDoParallel(cores = 4)
+# system.time(
+#   metabric <-
+#     within(metabric, {
+#       dt <-
+#         foreach(
+#           gns = itertools::isplitVector(x = unique(canonical_transcripts$gene)
+#                                         , chunkSize = 1000)
+#           , .combine = function(x, y){merge(x, y, "rn")}
+#           ) %do% {
+#             as.data.table(
+#               getProfileData(
+#                 x =  CGDS("http://www.cbioportal.org/")
+#                 , genes = gns
+#                 # , geneticProfiles = "brca_metabric_mrna_median_Zscores" ## no longer working
+#                 , geneticProfiles = "brca_metabric_mrna_median_all_sample_Zscores"
+#                 , caseList = "brca_metabric_all"
+#                 )
+#               , keep.rownames = TRUE
+#             )
+#           }
+#       dt <-
+#         dt[rowSums(is.na(dt[, -1])) != ncol(dt[, -1]), ] ## remove rows (samples) where all cols (genes) are NA
+#       dt <-
+#         setnames(tdt(dt), "rn", "gene")
+#       dt <-
+#         dt[rowSums(is.na(dt[, -1])) != ncol(dt[, -1]), ] ## remove rows (genes) where all cols (samples) are NA
+# 
+#       clinical <-
+#         as.data.table(cgdsr::getClinicalData(CGDS(url = "https://www.cbioportal.org/"), caseList = "brca_metabric_all"), keep.rownames = "sample")
+#       clinical[, OS.time   := OS_MONTHS]
+#       clinical[, OS := as.integer(gsub("\\:.*$", "", OS_STATUS))]
+# 
+#       clinical[, pam50 :=  CLAUDIN_SUBTYPE]
+#       clinical[pam50 == "Normal", pam50 := "Normal-like"]
+#       clinical[, pam50 := factor(pam50, levels = names(palval_pam50))]
+#       clinical[, her2_status := factor(HER2_STATUS, levels = names(palval_HER2))]
+# 
+# 
+#       model <-
+#         get_signature_model(
+#           # genes = c("WTAP", "METTL3", "METTL14", "ELP1", "ELP2", "ELP3", "ELP4", "ELP5", "ELP6", "CTU1", "CTU2", "MOCS3", "URM1")
+#           genes = c(geneset$m6A, geneset$mcm5, geneset$s2U)
+#           , data = merge(clinical, setnames(tdt(dt), "rn", "sample"), "sample")
+#           , fml.lhs = "Surv(OS.time, OS)"
+#           , ncores = 12
+#           )
+# 
+#       sig <-
+#         Reduce("merge",
+#                list(
+#                  getIterSignature(model, dt),
+#                  getUniSignature(model, dt),
+#                  getMultiSignature(model, dt),
+#                  get_mRNAsi(dt,  fnSig = mRNAsi_model_file),
+#                  get_proliferativeIndex(dt[complete.cases(dt), ]),
+#                  tdt(dt)[, .(sample = rn
+#                              , sig_m6A  = METTL3 + METTL14 + WTAP  # + RBM15 + VIRMA + CBLL1
+#                              , sig_mcm5 = ELP1   + ELP2    + ELP3  + ELP4  + ELP5  + ELP6
+#                              , sig_s2U  = CTU1   + CTU2    + MOCS3 + URM1
+#                        ) ][, sig_mcm5s2U := sig_mcm5 + sig_s2U]
+# 
+#                  )
+#                )
+# 
+#     sig[, PanEpi := scale1(signatureUni)]
+#     sig[, PanEpiBin := cut_signature(PanEpi)]
+# 
+#     fit = get_exbinFit(dt, exlenTabGene)
+# 
+# 
+# 
+#       })
+# 
+# 
+# )
+# registerDoSEQ()
+# 
+# metabric$dt[, 1:10]
+
+```
+
+```{r METABRIC_signature_model.RData}
+
+# saveRDS(metabric$model, "~/exports/METABRIC_signature_model.RData")
+
+metabric = list(model = readRDS("~/exports/METABRIC_signature_model.RData"))
+
+```
+
+## GTEx
+
+```{r gtex}
+
+if(!exists("gtex")){gtex = list()}
+
+gtex$url = "https://storage.googleapis.com/adult-gtex/bulk-gex/v7/rna-seq/GTEx_Analysis_2016-01-15_v7_RNASeQCv1.1.8_gene_median_tpm.gct.gz"
+
+gtex$file = file.path(tmpDir, basename(gtex$url))
+if(!file.exists(gtex$file)){download.file(gtex$url, gtex$file)}
+
+gtex$bulk = fread(gtex$file)
+
+gtex$bulk[, ensembl_gene_id := gsub("\\..*$", "", gene_id)]
+
+gtex$bulk[, gene := setkeyv(canonical_transcripts[isUnique(ensembl_gene_id)], "ensembl_gene_id")[ensembl_gene_id, gene]]
+gtex$bulk[, c("gene_id", "Description", "ensembl_gene_id") := NULL]
+setcolorder(gtex$bulk, "gene")
+
+gtex$sig <-
+  with(gtex, Reduce("merge",
+         list(
+           #getIterSignature(metabric$model, dt),
+           getUniSignature(metabric$model, bulk),
+           #getMultiSignature(metabric$model, dt),
+           as.data.table(TCGAanalyze_Stemness(stemSig = SC_PCBC_stemSig, dataGE = bulk[, as.matrix(.SD[, -1], rownames = .SD[[1]])]))[, .(sample = Sample, stemness_score) ],
+           get_proliferativeIndex(bulk),
+           tdt(bulk)[, .(sample = rn
+                       , sig_m6A  = METTL3 + METTL14 + WTAP  + RBM15 + VIRMA + CBLL1
+                       , sig_mcm5 = ELP1   + ELP2    + ELP3  + ELP4  + ELP5  + ELP6 + ALKBH8
+                       , sig_s2U  = CTU1   + CTU2    + MOCS3 + URM1
+                       , sig_OSGEP = OSGEP + LAGE3 + TPRKB + TP53RK + GON7
+                 ) ][, sig_mcm5s2U := sig_mcm5 + sig_s2U]
+
+         )))
+
+```
+
+## TCGA
+
+```{r pancan}
+
+if(!exists("pancan")){
+  pancan = list()
+}
+
+system.time(
+  pancan <-
+    within(pancan, {
+      ## gene expression
+      dataURL = "http://api.gdc.cancer.gov/data/3586c0da-64d0-4b74-a449-5ff4d9136611"
+      dataFile = file.path(tmpDir, "EBPlusPlusAdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv")
+      if(!file.exists(dataFile))download.file(dataURL, dataFile, method = "wget")
+      dt <-
+        fread(dataFile)
+      rm(dataURL, dataFile)
+      
+      dt[, gene := gsub("\\|.*$", "", gene_id)]
+      setcolorder(dt, "gene")
+      dt[, gene_id := NULL]
+      dt[, gene := sedit(gene, c("IKBKAP", "KIAA1429", "C17orf81", "C3orf75", "ATPBD3"), c("ELP1", "VIRMA", "ELP5", "ELP6", "CTU1"))]
+      dt <- 
+        dt[gene != "?" & ! duplicated(gene), ]
+      
+      ## molecular subtypes
+      molecular_subtypes <-
+        as.data.table(TCGA_MolecularSubtype(get_bcr_patient_barcode(names(dt[, -1])))[["subtypes"]])
+      
+      
+    })
+)
+
+system.time(
+  pancan <-
+    within(pancan, {
+      ## clinical data 
+      dataURL = "https://ars.els-cdn.com/content/image/1-s2.0-S0092867418302290-mmc1.xlsx"
+      dataFile = file.path(tmpDir, basename(dataURL))
+      if(!file.exists(dataFile))download.file(url = dataURL, destfile = dataFile, quiet = TRUE)
+      clinical <-
+        as.data.table(read_xlsx(dataFile, sheet = "TCGA-CDR", col_types = c("skip", rep("text", 33) )))
+      rm(dataURL, dataFile)
+      
+      clinical[,
+               binary_stage := ifelse(
+                 grepl("Stage III.*|Stage IV.*"
+                       , ajcc_pathologic_tumor_stage)
+                 , "Stage III/IV"
+                 , ifelse(
+                   grepl("Stage I([^I]|$)|Stage II([^I]|$)"
+                         , ajcc_pathologic_tumor_stage)
+                   , "Stage I/II"
+                   , NA
+                 )
+               )
+      ]
+      for(survtype in c("OS", "DSS", "DFI", "PFI")){
+        clinical[, paste0(survtype) := lapply(.SD, function(x)as.logical(as.integer(x))), .SDcols = paste0(survtype) ]
+        clinical[, paste0(survtype, ".time") := lapply(.SD, as.integer), .SDcols = paste0(survtype, ".time") ]
+      }
+      
+    })
+)
+
+unique(pancan$clinical$type)
+
+system.time(
+  pancan$sig <-
+    with(pancan, 
+         foreach(tp = unique(clinical$type), .combine = rbind ) %do% {
+           data = dt[, .SD[, c(1, which(setkeyv(clinical, "bcr_patient_barcode")[get_bcr_patient_barcode(names(.SD)), type] == tp )), with = FALSE ] ]
+           
+           Reduce(function(x,y){merge(x,y)}, list(
+             getUniSignature(metabric$model, data)[, PanEpi := scale1(signatureUni)][, PanEpiBin := cut_signature(PanEpi)],
+             as.data.table(TCGAanalyze_Stemness(stemSig = SC_PCBC_stemSig, dataGE = data[, as.matrix(.SD[, -1], rownames = .SD[[1]])]))[, .(sample = Sample, stemness_score) ],
+             get_proliferativeIndex(data),
+             tdt(data)[, .(sample = rn
+                           , sig_m6A  = METTL3 + METTL14 + WTAP  + RBM15 + VIRMA + CBLL1
+                           , sig_mcm5 = ELP1   + ELP2    + ELP3  + ELP4  + ELP5  + ELP6 + ALKBH8
+                           , sig_s2U  = CTU1   + CTU2    + MOCS3 + URM1
+             ) ][, sig_mcm5s2U := sig_mcm5 + sig_s2U]
+           ))
+         }
+    )
+)
+
+
+pancan$dt[gene %in% metabric$model$coxUniTab$gene, ][order(gene), 1:10]
+head(pancan$sig)
+
+```
+
+```{r surv_type_summary}
+
+typesList = as.list(pancan$clinical[, .N, by = .(type)][order(-N)][, unique(type)])
+
+surv_type_summary <-
+  
+  foreach(types = typesList, .combine = rbind ) %do% {
+    with(pancan,
+         sig[
+           get_bcr_sample_type(sample) %in% c("TB", "TP")
+         ][
+           , .(bcr_patient_barcode = get_bcr_patient_barcode(sample), PanEpi, signatureUni)
+         ][
+           , merge(.SD, clinical)
+         ][
+           #type != "LAML" &
+           type %in% types
+           # type %in% c("COAD", "READ")
+           # type %in% c("UCEC")
+         ][
+           , {
+             cp <-
+               surv_cutpoint(
+                 .SD,
+                 time = "OS.time",
+                 event = "OS",
+                 variables = "PanEpi"
+               )
+             sc <-
+               surv_categorize(cp, "PanEpi")
+             
+             sd <-
+               survdiff(formula = Surv(OS.time, OS) ~ PanEpi, data = sc)
+             
+             fit <-
+               survfit(Surv(OS.time, OS) ~ PanEpi, data = sc)
+             
+             data.table(type = types,
+                        cutpoint = cp$cutpoint$cutpoint,
+                        high_N = fit$strata[["PanEpi=high"]],
+                        low_N  = fit$strata[["PanEpi=low"]],
+                        high_exp = sd$exp[1],
+                        low_exp  = sd$exp[2],
+                        high_obs = sd$obs[1],
+                        low_obs  = sd$obs[2],
+                        pval = pairwise_survdiff(formula = Surv(OS.time, OS) ~ PanEpi, data = sc)[["p.value"]]
+             )
+           }
+           
+         ]
+    ) 
+  }
+
+
+surv_type_summary[, modrisk := ifelse(high_obs > high_exp, "s2U", "m6A")] 
+
+#surv_type_summary[, typerank := factor(type, levels = unique(type[order(type)]))]
+surv_type_summary[, typerank := factor(type, levels = unique(type[order(pval.high)]))]
+#surv_type_summary[, typerank := factor(type, levels = unique(type[order(high_N+low_N)]))]
+```
+
+## SCAN-B
+
+The GSE for the training dataset is GSE81538. The GSE for the test dataset is GSE96058. According to https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM2155558, the expression data is log2(FPKM + 0.1 pseudocount)
+
+```{r scanb}
+
+system.time(
+scanb <-
+  within(list(), {
+    trainDataURL = URLdecode("ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE81nnn/GSE81538/suppl/GSE81538%5Fgene%5Fexpression%5F405%5Ftransformed%2Ecsv%2Egz")
+    trainDataFile = file.path(tmpDir, basename(trainDataURL))
+    if(!file.exists(trainDataFile))download.file(url = trainDataURL, destfile = trainDataFile, quiet = TRUE)
+
+  testDataURL = URLdecode("ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE96nnn/GSE96058/suppl/GSE96058%5Fgene%5Fexpression%5F3273%5Fsamples%5Fand%5F136%5Freplicates%5Ftransformed%2Ecsv%2Egz")
+  testDataFile = file.path(tmpDir, basename(testDataURL))
+  if(!file.exists(testDataFile))download.file(url = testDataURL, destfile = testDataFile, quiet = TRUE)
+  
+  dt <-
+    setnames(merge(fread(trainDataFile), fread(testDataFile)), "V1", "gene")
+  dt[, gene := sedit(gene, c("IKBKAP", "KIAA1429", "C17orf81", "C3orf75", "ATPBD3"), c("ELP1", "VIRMA", "ELP5", "ELP6", "CTU1"))]
+  
+  rm(testDataURL, testDataFile, trainDataURL, trainDataFile)
+  
+  sig <-
+    Reduce("merge",
+           list(
+             getUniSignature(metabric$model, dt),
+             get_mRNAsi(dt,  fnSig = file.path("../data", "pcbc-stemsig.tsv")),
+             get_proliferativeIndex(dt),
+             tdt(dt)[, .(sample = rn
+                         , sig_m6A  = METTL3 + METTL14 + WTAP  # + RBM15 + VIRMA + CBLL1
+                         , sig_mcm5 = ELP1   + ELP2    + ELP3  + ELP4  # + ELP5  + ELP6 ## had to omit ELP5/6 bc not in SCAN-B data
+                         , sig_s2U  = CTU1   + CTU2    + MOCS3 + URM1
+                         ) ][, sig_mcm5s2U := sig_mcm5 + sig_s2U]
+               
+             ))
+    sig[, PanEpi := scale1(signatureUni)]
+    sig[, PanEpiBin := cut_signature(PanEpi)]
+    
+    clinical <-
+      rbindlist(foreach(gse = c("GSE81538", "GSE96058")) %do% {
+        gset = suppressMessages(getGEO(GEO = gse, destdir = tmpDir))[[1]]
+        pheno = as.data.table(gset@phenoData@data)
+        clindata <-
+          data.table(sample = pheno[["title"]]
+                     , pam50  = pheno[["pam50 subtype:ch1"]]
+                     , ki67  = pheno[["ki67 consensus:ch1"]]
+                     , er = pheno[["er consensus:ch1"]]
+                     , her2 = pheno[["her2 consensus:ch1"]]
+                     , pgr = pheno[["pgr consensus:ch1"]]
+                     , OS = pheno[["overall survival event:ch1"]]
+                     , OS.time = pheno[["overall survival days:ch1"]]
+                     )
+        return(clindata)
+        
+      }, fill = TRUE)
+    
+      ## adapt PAM50 nomenclature
+      clinical[, pam50 := gsub("^Normal$", "Normal-like", pam50)]
+      clinical[, pam50 := factor(pam50, levels = names(palval_pam50))]
+      
+      clinical[, her2_status := factor(ifelse(her2 == 0, "Negative", ifelse(her2 == 1, "Positive", NA )), levels = c("Positive", "Negative") ) ]
+      
+      ## bring survival data in general format OS / OS.time (seems to be available only for the testing dataset GSE96058)
+      for(survtype in c("OS")){
+        clinical[, paste0(survtype) := lapply(.SD, function(x)as.logical(as.integer(x))), .SDcols = paste0(survtype) ]
+        clinical[, paste0(survtype, ".time") := lapply(.SD, as.integer), .SDcols = paste0(survtype, ".time") ]
+        }
+    
+    model <-
+      get_signature_model(
+          genes = intersect(metabric$model$coxUniTab$gene, dt$gene)
+          , data = merge(clinical[!is.na(OS), ], setnames(tdt(dt), "rn", "sample"), "sample")
+          , fml.lhs = "Surv(OS.time, OS)"
+          , ncores = 12
+          )
+
+  })
+)
+
+scanb$dt[grepl("^ELP", gene), 1:10]
+
+```
+
+# Figures
+
+```{r metabric_coefficients, fig.width = 4, fig.height = 4}
+
+rbindlist(lapply(metabric$model$coxUniList, function(x){as.data.table(coef(summary(x)), keep.rownames = "gene")}))[
+  , .SD
+][
+  , ggplot(.SD,
+           aes(x = factor(gene, levels = rev(c(geneset$m6A, geneset$mcm5, geneset$s2U)) ),
+               y = exp(coef),
+               col = get_geneset_name(gene = gene, geneset = geneset) )) +
+    geom_errorbar(aes(ymin = exp(coef - `se(coef)`),
+                      ymax = exp(coef + `se(coef)`)),
+                  width = 0) +
+    geom_point(aes(size = -log10(`Pr(>|z|)`))) +
+
+    geom_hline(yintercept = 1, linetype = 2) +
+    scale_color_manual(values = palval_sets, na.value = "black") +
+    labs(x="Gene", y = "Relative risk", color = "Geneset", size = expression(-log[10]*"(p-value)")) +
+    theme_bw() +
+    coord_flip() +
+    NULL
+]
+
+```
+
+```{r gtex_stemness, fig.width = 3, fig.height = 3}
+
+
+gtex$sig[
+  !grepl("Cells", sample)
+][
+  , merge(.SD, gtex$bulk[gene %in% metabric$model$coxUniTab$gene, setnames(tdt(.SD), "rn", "sample") ] , "sample")
+][
+  , balance_score := (CTU1   + CTU2    + MOCS3 + URM1) / (METTL3 + METTL14 + WTAP)
+][
+  ,  ggplot(.SD
+            , aes(x = balance_score
+                  , y = stemness_score
+            )
+  ) +
+    geom_point() +
+    geom_smooth(method = "lm", col = "red") +
+    # geom_text_repel(data = function(x){x[mRNAsi > 0.55, ]}
+    #                 , aes(label = sample)
+    #                 , size = 3
+    #                 ) +
+    stat_cor(label.x.npc = "right", hjust = 1, label.y = 0, vjust = 0, label.sep = "\n") +
+    theme_bw() +
+    labs(x = expression("mcm"^5*"s"^2*U/m^6*A~" expression ratio ["*log[2]*"]")
+         , y = "Stemness index")
+]
+
+ggsave(file.path(figDir, "gtex_stemness.pdf"), width = 3, height = 3)
+
+```
+
+```{r tcga_balance}
+
+copy(pancan$sig)[
+  , patient := get_bcr_patient_barcode(sample)
+][
+  , disease := setkeyv(pancan$clinical, "bcr_patient_barcode")[patient, type]
+][
+  , sample_type := get_bcr_sample_type(sample)
+][
+  , {
+    matched_sample_patients <-
+      dcast(.SD[, .N, by = .(patient, sample_type)], patient ~ sample_type, value.var = "N")[NT > 0 & TP > 0, patient]
+    
+    matched_sample_diseases <-
+      dcast(.SD[patient %in% matched_sample_patients, ], disease ~ sample_type, fun.aggregate = length)[NT > 3 & TP > 3 , unique(disease)]
+    
+    .SD[disease %in% matched_sample_diseases & patient %in% matched_sample_patients]
+    
+  }
+][
+  , merge(.SD, pancan$dt[gene %in% metabric$model$coxUniTab$gene, setnames(tdt(.SD), "rn", "sample") ] , "sample")
+][
+  , balance_score := (CTU1   + CTU2    + MOCS3 + URM1) / (METTL3 + METTL14 + WTAP)
+][
+  , disease := factor(disease, levels = .SD[, .(median(balance_score, na.rm = TRUE)), by = .(disease)][order(V1), disease])
+][
+  sample_type %in% c("NT", "TP")
+][
+  , {
+    
+    stats <-
+      dcast(.SD, patient + disease ~ sample_type, value.var = "balance_score")[
+        , .(ttest.pval = t.test(TP, NT, paired = TRUE, alternative = "greater")$p.value,
+            wilcox.pval = wilcox.test(TP, NT, paired = TRUE, alternative = "greater" )$p.value)
+        , by = disease]
+    
+    ggplot(.SD,
+           aes(x = sample_type,
+               y = log2(balance_score)
+           )) +
+      geom_quasirandom(alpha = 0.5, shape = 21) +
+      stat_summary(fun.data = mean_sd, col = "red", geom = "errorbar", aes(ymin = after_stat(y), ymax = after_stat(y)) ) +
+      stat_compare_means(method = "wilcox.test", method.args = list(paired = TRUE, alternative = "less"), label = "p.signif", label.x.npc = 0.5, hjust = 0.5, vjust = 0, ) +
+      facet_wrap( ~ disease, nrow = 2) +
+      scale_y_continuous(expand = expansion(c(0.05, 0.15))) +
+      theme_bw() +
+      theme(axis.title.x = element_blank()) +
+      labs(y = expression("mcm5s"^2*U/m^6*A~" expression ratio ["*log[2]*"]") )
+    
+  }
+]
+
+ggsave(file.path(figDir, "tcga_balance.pdf"), width = 8, height = 4)
+ggsave(file.path(figDir, "tcga_balance.png"), width = 8, height = 4)
+
+```

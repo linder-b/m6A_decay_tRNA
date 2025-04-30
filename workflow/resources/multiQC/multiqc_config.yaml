@@ -1,0 +1,6 @@
+extra_fn_clean_trim:
+  - _R1
+  - _1
+  - _biotype
+  - _screen
+  - .infer_experiment

@@ -1,0 +1,9 @@
+experiment	run	title	layout	type	species	spikein	read1	read2	source
+miCLIP	miCLIP	miCLIP	PAIRED	miclip	homo_sapiens		miCLIP_1.fastq.gz	miCLIP_2.fastq.gz	ENA
+NatMeth	SRR2003406	HEK293_total_RNA_miCLIP_SySy	SINGLE	miclip	homo_sapiens		SRR2003406.fastq.gz		ENA
+NatMeth	SRR1686787	HEK293_total_RNA_miCLIP_Abcam	SINGLE	miclip	homo_sapiens		SRR1686787.fastq.gz		ENA
+NatMeth	SRR1686788	HEK293_mRNA_miCLIP_rep1	PAIRED	miclip	homo_sapiens		SRR1686788_1.fastq.gz	SRR1686788_2.fastq.gz	ENA
+NatMeth	SRR1686789	HEK293_mRNA_miCLIP_rep2	PAIRED	miclip	homo_sapiens		SRR1686789_1.fastq.gz	SRR1686789_2.fastq.gz	ENA
+NatMeth	SRR1686790	HEK293_mRNA_miCLIP_rep3	PAIRED	miclip	homo_sapiens		SRR1686790_1.fastq.gz	SRR1686790_2.fastq.gz	ENA
+NatMeth	SRR1686791	HEK293_mRNA_mICLIP_rep4	PAIRED	miclip	homo_sapiens		SRR1686791_1.fastq.gz	SRR1686791_2.fastq.gz	ENA
+Mauer_et_al	SRR3176281	miCLIP_of_HEK293T	SINGLE	miclip	homo_sapiens		SRR3176281.fastq.gz		ENA

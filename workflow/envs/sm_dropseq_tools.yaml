@@ -1,0 +1,8 @@
+name: sm_dropseq_tools
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - dropseq_tools

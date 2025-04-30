@@ -1,0 +1,4 @@
+#########
+## Mycoplasma - as per: http://crazyhottommy.blogspot.com/2018/01/atacseq-contamination-of-mycoplasma-dna.html
+## wget -r --include-directories="genomes/archive/old_refseq/Bacteria/Mycoplasma_*" --no-parent -nH --cut-dir=5 -A "*fna" ftp://ftp.ncbi.nlm.nih.gov/genomes/archive/old_refseq/Bacteria/
+DATABASE        Mycoplasma   /tmpdata/linder/fastq_screen/FastQ_Screen_Genomes/Mycoplasma/Mycoplasma

@@ -1,0 +1,84 @@
+import re
+
+configfile: "input.yaml"
+DATA_DIR=config["data_dir"]
+ADAPTER=config["adapter_seq"]
+STAR_PARAMS=config["STAR_params"]
+STAR_INDEX=config["STAR_index"]
+
+
+
+(SAMPLES,)= glob_wildcards(DATA_DIR + "/{sample}.fastq")
+
+
+
+rule all:
+  input:
+   expand("mapping_dedup/{sample}_dedup.bam",sample=SAMPLES)
+   #expand("mapping_dedup/{sample}_test.txt",sample=SAMPLES)
+
+
+
+
+rule UMI_extract: 
+    input: 
+      DATA_DIR + "/{sample}.fastq"
+    log: 
+      "data_UMI/{sample}_extract.log"
+    output:
+      fastq_UMI="data_UMI/{sample}_UMI.fastq"
+
+    shell:
+      "umi_tools extract --extract-method=string --bc-pattern=NNNNNNNNNNNN -L {log}  --stdin={input} --stdout {output.fastq_UMI}"
+
+rule clip_adapter:
+  input:
+    "data_UMI/{sample}.fastq"
+  params:
+    ADAPTER
+  output:
+    fastq_cl="data_cl/{sample}_cl.fastq",
+    cl_report="data_cl/{sample}_cl_report.txt"
+  shell:
+    "cutadapt -j 10 -m 25 -q 25 -a {params}  {input} > {output.fastq_cl} 2>> {output.cl_report}"
+
+
+
+
+rule rm_polyA: 
+    input: 
+      "data_cl/{sample}.fastq"
+    output:
+      fastq_rmpA="data_tr/{sample}_rmpolyA.fastq",
+      tr_report="data_tr/{sample}_rmpolyA_report.txt"
+    shell:
+      "cutadapt -j 10 -m 15 --poly-a {input} -o {output.fastq_rmpA} > {output.tr_report}"
+
+
+
+rule mapping:
+    input:
+      "data_tr/{sample}_UMI_cl_rmpolyA.fastq"
+    log: 
+      report="mapping/{sample}_mapping_report.txt"
+    output:
+      fastq="mapping/{sample}_Aligned.sortedByCoord.out.bam"
+    shell:
+        '''STAR --runThreadN 10 --genomeDir {STAR_INDEX}  --readFilesIn {input} {STAR_PARAMS}  --outFileNamePrefix mapping/{wildcards.sample}_ 1>> {log} '''
+
+rule rm_dup: 
+    input: 
+      #"mapping/{sample}_test.bam"
+      "mapping/{sample}_Aligned.sortedByCoord.out.bam"
+    params:
+      "mapping_dedup/{sample}_dedup"
+    output:
+      rm_dup="mapping_dedup/{sample}_dedup.bam",
+      run_report="mapping_dedup/{sample}_dedup_report.txt"
+      #test="mapping_dedup/{sample}_test.txt"
+    shell:
+      "samtools index {input} && umi_tools dedup -I {input} --output-stats={params} -S {output.rm_dup} 1>> {output.run_report}"
+#touch {output.test} && cp {input} {output.rm_dup} && touch {output.run_report} && touch {output.dedup_report}"
+
+#samtools index {input}
+#&& umi_tools dedup -I {input}  --output-stats={output.dedup_report} -S {output.rm_dup} 1>> {output.run_report}

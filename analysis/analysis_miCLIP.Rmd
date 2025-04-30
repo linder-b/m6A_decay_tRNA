@@ -1,0 +1,432 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Integrated analysis of multiple miCLIP experiments.
+
+# Prerequisites
+
+Requires the objects from the "Prerequisites" and "Transcript Model" sections of the the "analysis_human.qmd" notebook.
+
+# Data
+
+## Pileup BAMs
+
+```{r bamList}
+
+bamList = list.files(paste0("../results/",c("miCLIP", "DRB", "NatMeth", "Mauer_et_al"),"/star/homo_sapiens_GRCh38_v35"), ".Aligned.sortedByCoord.out.dedup.bam$", full.names = TRUE)
+names(bamList) = gsub(".Aligned.sortedByCoord.out.dedup.bam", "", basename(bamList))
+
+names(bamList)
+
+```
+
+```{r pileup parameters}
+require("Rsamtools")
+require("data.table")
+
+## choose read start position bins that are available for downstream position-dependent filtering 
+#query_bins = c(0,1,2,3,4, Inf)
+query_bins = c(1:100, Inf)
+
+
+puparam <-
+  PileupParam(
+    # max_depth = 1000000,
+    min_base_quality = 24,
+    min_mapq = 60,
+    min_nucleotide_depth = 2,
+    min_minor_allele_depth = 1, # return only positions that have at least one mismatch
+    distinguish_strands = TRUE,
+    distinguish_nucleotides = TRUE,
+    ignore_query_Ns = TRUE,
+    include_deletions = TRUE,
+    include_insertions = TRUE,
+    left_bins = NULL,
+    query_bins = query_bins, # bin by position in read to allow filtering later
+    cycle_bins = NULL
+  )
+
+bamparam <-
+  ScanBamParam(flag = scanBamFlag(isSecondaryAlignment = FALSE,
+                                  isDuplicate = FALSE))
+
+levels(cut(1:100, query_bins))
+
+```
+
+```{r pileup function}
+
+get_pileups <-
+  function(bamFile = NULL,
+           bamparam = NULL,
+           puparam = NULL,
+           bsg = NULL,
+           tmpDir = NULL, 
+           recalc = FALSE) {
+    puFile = file.path(tmpDir,
+                       paste0(basename(bamFile), ".pileup", digest::digest(c(bamparam, puparam)), ".tsv"))
+    
+    if (!file.exists(puFile) | recalc) {
+      cat(paste("Calculating pileup file..."))
+      pu <-
+        as.data.table(pileup(
+          file = bamFile,
+          scanBamParam = bamparam,
+          pileupParam = puparam
+        ))
+      
+      ## correct nucleotide for strandedness
+      # pu[strand == "-", nucleotide := chartr("AGCT", "TCGA", nucleotide)]
+      pu[, nuc_corr := ifelse(strand == "-",
+                              chartr("AGCT", "TCGA", as.character(nucleotide)),
+                              as.character(nucleotide))]
+      ## rename insertions and deletions
+      pu[nucleotide == "+", nuc_corr := "ins"]
+      pu[nucleotide == "-", nuc_corr := "del"]
+      
+      pu[, nuc_corr := factor(nuc_corr, levels =  c("A", "C", "G", "T", "del", "ins"))]
+      
+      ## get reference nucleotide
+      pu[seqnames %in% seqlevels(bsg) , ref := {
+        gr = GRanges(
+          seqnames = seqnames,
+          ranges = IRanges(start = pos, width = 1),
+          strand =  strand
+        )
+        seqlevels(gr, pruning.mode = "coarse") = seqlevels(bsg)
+        sq = BSgenome::getSeq(bsg, gr)
+        sq = as.character(sq)
+        return(sq)
+      }]
+      ## write pu
+      fwrite(pu, puFile, sep = "\t")
+      cat(paste("...done!\n"))
+    } else {
+      cat(paste("reading existing pileup file.\n"))
+      pu <-
+        fread(puFile)
+    }
+    
+    ## make sure query bins is a factor, as this is needed for downstream filtering
+    pu[, query_bin := factor(query_bin)]
+    pu[, query_bin := factor(query_bin, levels = gtools::mixedsort(levels(query_bin)))]
+    return(pu)
+    
+  }
+
+```
+
+
+```{r puList}
+
+registerDoParallel(cores = 10 )
+
+system.time(
+puList <-
+  foreach(bam = names(bamList)) %dopar% {
+    get_pileups(bamFile = bamList[[bam]], bamparam = bamparam, puparam = puparam, bsg = bsg, tmpDir = tmpDir)[, bam := bam] 
+  }
+)
+
+## sum counts of all samples
+pu <-
+  rbindlist(puList)[, .(count = sum(count)), by = setdiff(names(puList[[1]]), "count")]
+
+pu[, query_bin := factor(query_bin, levels = gtools::mixedsort(levels(query_bin)))]
+
+head(pu)
+
+```
+
+## Basic QC
+```{r}
+
+pu[
+  , .N, by = bam
+]
+
+pu[
+  nuc_corr != ref
+][
+  ,  ts := paste0(ref, ">", nuc_corr)
+][
+  !is.na(ts)
+  , .(N = .N)
+  , by = .(query_bin, ts, bam) 
+][
+  , frac := N / sum(N)
+  , by = .(ts, bam)
+][
+  ts == "C>T"
+][
+  , ggplot(.SD, aes(x = query_bin, y = frac )) +
+    geom_point(aes(col = bam)) +
+    facet_wrap(~ts) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4))
+]
+
+```
+
+```{r, fig.width = 24, fig.height = 24}
+
+pu[
+  nuc_corr != ref
+][
+  bam == "miCLIP"
+][
+  ,  ts := paste0(ref, ">", nuc_corr)
+][
+  !is.na(ts)
+  , .(N = .N, frac = .N / sum(.N))
+  , by = .(query_bin, ts, bam) 
+][
+  , ggplot(.SD, aes(x = query_bin, y = N)) +
+    geom_point(aes(col = bam)) +
+    facet_wrap(~ts) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4))
+]
+
+```
+
+
+# Analysis
+
+```{r puw_from_pu function}
+## a function to generate, pre-filter and annotate pileup
+puw_from_pu <- function(pu){
+  ## cast to wide to get info about each covered position
+puw.intern <-
+  dcast(
+    pu, ## here we could filter for position in read with usebin
+    seqnames + pos + strand + ref ~ nuc_corr ,
+    value.var = "count",
+    drop = c(TRUE, FALSE),
+    fill = 0,
+    fun.aggregate = sum
+    )
+## calculate total coverage
+puw.intern[, cvg := as.integer(rowSums(.SD)), .SDcols = c("A", "C", "G", "T", "-", "+")[c("A", "C", "G", "T", "-", "+") %in% colnames(puw.intern)]]
+require(matrixStats)
+require(GenomicFeatures)
+## only with defined reference base
+puw.intern <- puw.intern[ !is.na(ref) & !ref=="N", ]
+
+## only in reference transcripts
+puw.intern <- puw.intern[suppressWarnings(overlapsAny(GRanges(seqnames = seqnames, IRanges(start=pos, width =1), strand=strand), ex_by_tx)), ]
+
+## only where reference is major call
+puw.intern[ref == "A", is_major :=  `A` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "G", is_major :=  `G` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "C", is_major :=  `C` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+puw.intern[ref == "T", is_major :=  `T` >= rowMaxs(as.matrix(.SD))  , .SDcols=c("A","C", "G", "T") ]
+
+puw.intern <- puw.intern[ which(is_major), ]
+
+## only reference C
+puw.intern <- puw.intern[ref == "C", ]
+
+## get c2t  ratio
+puw.intern[, c2t := `T` / `C`]
+
+
+## shift to (putative) A 
+puw.intern[, posA := ifelse(strand == "+", pos-1, pos+1)]
+
+## annotate
+puw.intern.gr <- 
+  GRanges(seqnames = puw.intern$seqnames, IRanges(start=puw.intern$posA, width =1), strand=puw.intern$strand, mcols = DataFrame(puw.intern[, !c("seqnames", "posA", "pos", "strand")]))
+
+puw.intern[, kmer := suppressWarnings(as.character(getSeq(bsg, puw.intern.gr +2)))] ## genomic kmer
+
+puw.intern[, kmer_DRACH := grepl("[ATG][AG]AC[ACT]",kmer)]
+puw.intern[, kmer_A := grepl("..A..",kmer)]
+puw.intern[, tx_DRACH := suppressWarnings(overlapsAny(puw.intern.gr, drach.gr)) ]
+puw.intern[, in_tx := overlapsAny(puw.intern.gr, ex_by_tx) ]
+puw.intern[, tx_A := kmer_A & in_tx]
+
+return(puw.intern)
+}
+
+```
+
+```{r define posfilter}
+
+posfilterN  = 0 ## exclude first N positions in reads
+
+posfilter = levels(pu$query_bin)[(1+posfilterN):length(levels(pu$query_bin))]
+
+posfilter
+
+```
+
+```{r drach.gr}
+## DRACH sites in genome space
+drach.gr <- unique(mapFromTranscripts(drach.tx, ex_by_tx))
+
+drach.gr
+
+```
+
+## Evaluate calling parameters
+
+```{r puw}
+puw <-
+  puw_from_pu(pu)
+```
+
+## Call sites
+
+```{r manual call parameters}
+
+## define parameter cutoffs
+call_c2tNmin = 3
+call_c2tmin  = 0.02
+call_c2tmax  = 0.49
+
+```
+
+
+```{r call}
+
+puw[, call := NULL]
+puw[cvg > 90 & ref == "C" & `T` == 0, call := "unmethylated"]
+puw[ref == "C" & `T` > 0, call := "intermediate"]
+puw[ref == "C" &
+    (`T` >= call_c2tNmin &
+       c2t >= call_c2tmin &
+       c2t < call_c2tmax), call := "methylated"]
+
+puw[, call := factor(call)]
+
+puw[, .(N = .N, fracDRACH = sum(tx_DRACH)/length(tx_DRACH)*100), by = "call" ]
+
+```
+
+Overview plot:
+```{r plot_miclip_summary function}
+
+plot_miclip_summary <-
+  function(gr = NULL) {
+    p.hits.table <-
+      ggtexttable(tribble(~"", ~"", 
+                          "sites", as.character(length(gr)),
+                          "A", as.character(sum(gr$tx_A)),
+                          "DRACH", as.character(sum(gr$tx_DRACH)),
+                          "% A", as.character(round(sum(gr$tx_A)/length(gr)*100, 2)), 
+                          "% DRACH", as.character(round(sum(gr$tx_DRACH)/length(gr)*100, 2)),
+                          "% A in DRACH", as.character(round(sum(gr$tx_DRACH)/sum(gr$tx_A)*100, 2))),
+                  rows = NULL, cols = NULL)
+    
+    p.hits.logo <-
+      ggplot() + geom_logo(as.character(gr$kmer),
+                           seq_type = "dna",
+                           method = "probability") +
+      ylim(0, 1) +
+      #labs(title = "Called C>T transitions", subtitle = p.hits.subtit) +
+      NULL
+    
+    
+    
+    p.hits.meta <-
+      ggplot(data.frame(relpos.cds = relpos.cds.gr(suppressWarnings(
+        mapToTranscripts(gr, ex_by_tx)
+      ))), aes(x = relpos.cds)) +
+      geom_histogram(binwidth = 0.02) +
+      geom_vline(
+        xintercept = c(1, 2),
+        linetype = 2,
+        col = "blue",
+        lwd = 0.3
+      ) +
+      xlim(0.5, 3)
+    
+    p <-
+      ggarrange(
+        p.hits.logo,
+        p.hits.table,
+        p.hits.meta,
+        ncol = 1,
+        nrow = 3,
+        align = "v"
+      )
+    return(p)
+  }
+
+```
+
+
+```{r ## miclip_summary ,fig.width=10, fig.height=8}
+require(tibble)
+require(ggseqlogo)
+
+hits <- 
+  puw[ call == "methylated"  ,]
+
+hits.gr <- 
+  GRanges(seqnames = hits$seqnames,
+          IRanges(start=hits$posA, width =1),
+          strand=hits$strand)
+seqlevels(hits.gr) = seqlevels(ex_by_tx)
+
+mcols(hits.gr) <-
+  DataFrame(hits[, c("cvg", "c2t", "A", "C", "G", "T", "ins", "del", "kmer", "tx_DRACH", "tx_A")])
+
+
+# p.hits.paramspace <-
+#   ggplot(paramtest,
+#        aes(x=A_in_DRACH, y= nsites_DRACH)) +
+#   geom_point(alpha = 0.1) +
+#   geom_point(data = function(x)x[callrank == 1, ], col = "red", size = 2) +
+#   geom_hline(yintercept = target_nsites_A, linetype =2) +
+#   #geom_vline(xintercept = target_frac_DRACH, linetype = 2) +
+#   scale_y_continuous(trans="log10", limits = c(NA, NA)) + annotation_logticks(10, "l", TRUE) +
+#   xlim(0.5, NA) +
+#   facet_wrap(~c2tNmin, labeller = label_both) +
+#   NULL
+
+annotate_figure(ggarrange(NA, plot_miclip_summary(hits.gr),  ncol = 2, widths = c(3,1) ),
+                top = paste0("posfilterN=", posfilterN,
+                              " | c2tNmin=",
+                              call_c2tNmin,
+                              " | c2tmin=",
+                              call_c2tmin,
+                              " | c2tmax=",
+                              call_c2tmax
+                              )
+                )
+
+
+# save_last_plot(file = file.path(plotDir, "region_histogram.pdf"), owncube_dir = "exports/plots", width = 25, height = 8, scale = 2)
+
+```
+
+## BED file export
+We export all covered DRACH sites into a BED file and include the methylation status call in the site name.
+```{r}
+
+dir.create("../results/analysis_miCLIP")
+
+fwrite(
+  puw[tx_DRACH == TRUE, ## all C2T transitions in DRACH (only from full dataset)
+       .(
+         chr    = seqnames,
+         start  = format(posA -1 , scientific = FALSE), ## bed is 0-based
+         end    = format(posA    , scientific = FALSE),
+         name   = paste0(call,
+                         "_cvg", cvg,
+                         "_c", `C`,
+                         "_t", `T`),
+         score  = format(c2t *1000, digits = 3, scientific = FALSE), ## bed file format specifies score between 0 and 1000
+         strand = strand)],
+  file = "../results/analysis_miCLIP/miclip_c2t.bed",
+  sep = "\t",
+  row.names = F,
+  col.names = F
+)
+
+fread("../results/analysis_miCLIP/miclip_c2t.bed")
+
+```
+

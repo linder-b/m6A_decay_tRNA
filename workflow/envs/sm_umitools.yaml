@@ -1,0 +1,12 @@
+name: sm_umitools
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+# note that there is also a "umitools" package, but we need "umi_tools"
+dependencies:
+  - umi_tools
+
+  
+  

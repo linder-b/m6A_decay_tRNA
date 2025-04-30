@@ -1,0 +1,259 @@
+import pandas as pd
+from snakemake.utils import validate, min_version
+from datetime import datetime
+
+## This Snakefile is in the "workflow" subdirectory, but is run from the root directory cloned from git. All paths are relative to this root folder.
+
+# --- config file --- #
+
+try:
+    configfile_path = config['configfile_path']
+except:
+    configfile_path = "workflow/config/config.yaml"
+configfile: configfile_path
+
+# --- paths --- #
+
+## for easier referencing
+tmp_dir = config['local']['tmp_dir']
+fastq_dir = config['local']['fastq_dir']
+genome_dir = config['local']['genome_dir']
+logs_dir = config['local']['logs_dir']
+results_dir = config['local']['results_dir']
+
+
+# --- sample table --- #
+
+samples = pd.read_table(config['sample_table'])
+samples = samples.set_index("run", drop = False)
+
+## define all runs
+runs = list(samples['run'].values)
+
+
+# --- analysis types --- #
+
+valid_types = ['rnaseq', 'riboseq', 'slamseq', "m6aseq", "miclip"]
+
+if not 'type' in samples.columns:
+    print('Column "type" not found in samples.tsv; Using "rnaseq" analysis type as default for all samples.')
+    samples['type'] = ['rnaseq']*len(samples)
+
+if(any(~samples['type'].isin(valid_types))):
+    invalid_runs = samples.loc[~samples['type'].isin(valid_types), 'run']
+    print('Invalid analysis types in samples.tsv for runs '+', '.join(invalid_runs)+'; Using "rnaseq" as default for those samples.')
+    samples.loc[~samples['type'].isin(valid_types), 'type'] = "rnaseq"
+
+#runs_miclip  = samples[samples['type']=='miclip']['run'].values
+runs_miclip = {
+    row['run']: row['type'] == 'miclip'
+    for _, row in samples.iterrows()
+}
+
+runs_riboseq = samples[samples['type']=='riboseq']['run'].values
+runs_slamseq = samples[samples['type']=='slamseq']['run'].values
+
+
+# --- library layout --- #
+
+valid_layouts = ['SINGLE', 'PAIRED']
+
+if not 'layout' in samples.columns:
+    print('Column "layout" not found in samples.tsv! Using "SINGLE" as default for all samples.')
+    samples['layout'] = ['SINGLE']*len(samples)
+
+if(any(~samples['layout'].isin(valid_layouts))):
+    invalid_runs = samples.loc[~samples['layout'].isin(valid_layouts), 'run']
+    print('Invalid library layout in samples.tsv for runs '+', '.join(invalid_runs)+'. Using "SINGLE" as default for those samples.')
+    samples.loc[~samples['type'].isin(valid_types), 'type'] = "rnaseq"
+
+runs_PE = samples[samples['layout']=='PAIRED']['run'].values
+runs_SE = samples[samples['layout']!='PAIRED']['run'].values
+
+
+# --- PE reads --- #
+
+valid_reads =  ['1', '2']
+
+
+# --- species --- #
+
+valid_species = config['genomes']
+
+if not 'species' in samples.columns:
+    if 'species' in config.keys():
+        print('Column "species" not found in samples.tsv; Using species '+config['species']+' from config.yaml for all samples.')
+        samples['species'] = [config['species']]*len(samples)
+    else:
+        raise Exception('No species defined in either samples.tsv or config.yaml!\n')
+        # todo: run QC only
+
+
+print(samples)
+
+
+# --- wildcard functions --- #
+
+## functions for run-specific wildcard expansions.
+## the wildcard separator is programmatically included to enable wildcard omission (e.g. for samples without spike-in)
+
+def get_experiment(run):
+    if 'experiment' in samples.columns:
+        experiment=samples.loc[run, 'experiment']
+    elif 'experiment' in config.keys:
+        experiment=config['experiment']
+    else:
+        experiment="undefined_experiment"
+    return(experiment)
+
+def get_species(run):
+    if 'species' in samples.columns:
+        if samples.loc[run, 'species'] in config['genomes']:
+            species=samples.loc[run, 'species']
+            return(species)
+        else:
+            raise Exception("No genome defined in config.yaml for species \""+samples.loc[run, 'species']+'\" (run \"'+run+'\")!')
+    else:
+        if 'species' in config['metadata'].keys:
+            species=config['metadata']['species']
+            return(species)
+        else:
+            raise Exception('Column "species" not found in samples.tsv; Aborting analysis!')
+
+def get_build(run):
+    return(config['genomes'][get_species(run)]['build'])
+
+def get_release(run):
+    return(config['genomes'][get_species(run)]['release'])
+
+def expand_runs(strings, runs):
+    """Expand strings based on run info in sample_table"""
+    if isinstance(strings, str): strings = [strings] ## we need a list
+    out_strings = []
+    for string in strings:
+        for run in runs:
+            out_strings.append(string.format(
+                run=run,
+                experiment=get_experiment(run),
+                species=get_species(run),
+                build=get_build(run),
+                release=get_release(run)))
+    out_strings = list(set(out_strings)) ## make unique; note that result is unordered
+    return(out_strings)
+
+
+# --- get parameters from config --- #
+
+def get_params(run, parameter_name):
+    experiment = get_experiment(run)
+    if experiment in config['experiments']:
+        if parameter_name in config['experiments'][experiment]:
+            print("Found experiment-specific "+parameter_name+" parameters for run "+run+" from experiment "+experiment+" in config file.\n")
+            params=config['experiments'][experiment][parameter_name]
+        elif parameter_name in config['defaults']:
+            print(parameter_name+" parameters not found for run "+run+" from experiment "+experiment+". Using defaults from config file.\n")
+            params=config['defaults'][parameter_name]
+    elif parameter_name in config['defaults']:
+        print(parameter_name+" parameters not found for run "+run+" from experiment "+experiment+". Using defaults from config file.\n")
+        params=config['defaults'][parameter_name]
+    else:
+        raise(parameter_name+" parameters not found for run "+run+" from experiment "+experiment+". Also no defaults found in config file!\n")
+        params = [""]
+    return(params)
+
+
+# --- wildcard constraints --- #
+
+# add a dummy constraint to avoid an empty list leading to unconstrained wildcards
+constraints_SE="SE_dummy_constraint" if len(runs_SE) == 0 else '|'.join(runs_SE)
+constraints_PE="PE_dummy_constraint" if len(runs_PE) == 0 else '|'.join(runs_PE)
+
+wildcard_constraints:
+    run='|'.join(runs),
+    read='|'.join(valid_reads),
+    species='|'.join([get_species(run) for run in runs]),
+    build='|'.join([get_build(run) for run in runs]),
+    release='|'.join([get_release(run) for run in runs])
+
+
+# --- main rules --- #
+rule all:
+    input:
+        GRANDSLAM = expand_runs(results_dir+"/{experiment}/gedi/{species}_{build}_{release}/slam.tsv", runs_slamseq),
+        miCLIP_dedup=expand_runs(results_dir+'/{experiment}/star/{species}_{build}_{release}/{run}.Aligned.sortedByCoord.out.dedup.bam.bai', runs = samples[samples['type']=='miclip']['run'].values),
+        multiQC = expand_runs(logs_dir+'/{experiment}_multiqc.html', runs),
+        idx = expand_runs([results_dir+'/{experiment}/star/{species}_{build}_{release}/{run}.Aligned.sortedByCoord.out.bam.bai'], runs)
+      
+
+rule multiqc_sample_rename:
+    output:
+        sample_rename_table=logs_dir+'/sample_rename.tsv'
+    run:
+        pd.DataFrame(samples[['title']]).to_csv(path_or_buf=output.sample_rename_table, sep='\t')
+
+pd.DataFrame(samples[['title']]).to_csv(path_or_buf=logs_dir+'/sample_rename.tsv', sep='\t')
+rule multiqc:
+    input:
+        RSEQC = lambda wildcards: expand_runs(
+            [logs_dir+'/{experiment}/rseqc/{species}_{build}_{release}/{run}.infer_experiment.txt',
+             logs_dir+'/{experiment}/rseqc/{species}_{build}_{release}/{run}.mismatch_profile.r'],
+             samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        STAR =  lambda wildcards: expand_runs(logs_dir+'/{experiment}/star/{species}_{build}_{release}/{run}.Log.final.out',
+            samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        UMITOOLS =  lambda wildcards: expand_runs(logs_dir+'/{experiment}/umitools/{species}_{build}_{release}/{run}.dedup.log',
+            samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        PICARD_ISIZE = lambda wildcards: expand_runs(logs_dir+'/{experiment}/picard/{species}_{build}_{release}/{run}.isize.txt',
+            samples.query(f" experiment == @wildcards.experiment & run == {list(runs_PE)} ")['run'].tolist() ),
+        PICARD_RNASEQMETRICS= lambda wildcards: expand_runs(
+            logs_dir+'/{experiment}/picard/{species}_{build}_{release}/{run}.rna_metrics.txt',
+            samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        FEATURECOUNTS_BIOTYPE = lambda wildcards: expand_runs(
+            [logs_dir+'/{experiment}/featureCountsBiotype/{species}_{build}_{release}/{run}_biotype_counts_mqc.txt',
+             logs_dir+'/{experiment}/featureCountsBiotype/{species}_{build}_{release}/{run}_biotype_counts_gs_mqc.tsv'],
+             samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        flexbar = lambda wildcards: expand_runs( 
+            logs_dir+'/{experiment}/flexbar/{run}.log',
+            samples.query(" experiment == @wildcards.experiment ")['run'].tolist() ),
+        # fastq_screen_SE = lambda wildcards: expand_runs(
+        #     logs_dir+'/{experiment}/fastqscreen/{run}_screen.txt',
+        #     samples.query(f" experiment == @wildcards.experiment & run == {list(runs_SE)} ")['run'].tolist() ),
+        # fastq_screen_PE = lambda wildcards: expand_runs(
+        #     logs_dir+'/{experiment}/fastqscreen/{run}_1_screen.txt',
+        #      samples.query(f" experiment == @wildcards.experiment & run == {list(runs_PE)} ")['run'].tolist() ),
+        fastqc_SE = lambda wildcards: expand_runs(
+            logs_dir+'/{experiment}/fastqc/{run}_fastqc.html',
+            samples.query(f" experiment == @wildcards.experiment & run == {list(runs_SE)} ")['run'].tolist() ),
+        fastqc_PE = lambda wildcards: expand_runs(
+            logs_dir+'/{experiment}/fastqc/{run}_1_fastqc.html',
+            samples.query(f" experiment == @wildcards.experiment & run == {list(runs_PE)} ")['run'].tolist() ),
+        sample_rename_table=logs_dir+'/sample_rename.tsv'
+    output:
+        html=logs_dir+'/{experiment}_multiqc.html'
+    params:
+        inDir=logs_dir+'/{experiment}',
+        outDir=logs_dir,
+        outFile="{experiment}_multiqc.html"
+    conda: 'envs/sm_multiqc.yaml'
+    shell:
+        '''
+        multiqc \
+        --config workflow/resources/multiQC/multiqc_config.yaml \
+        --sample-names {input.sample_rename_table} \
+        --outdir {params.outDir} \
+        --filename {params.outFile} \
+        --force \
+        {params.inDir}
+        '''
+
+include: "rules/get_genomes.smk"
+include: "rules/get_input_files.smk"
+include: "rules/fastqc.smk"
+include: "rules/featureCountsBiotype.smk"
+include: "rules/fastq_screen.smk"
+include: "rules/flexbar.smk"
+include: "rules/STAR.smk"
+include: "rules/picard.smk"
+include: "rules/gedi.smk"
+include: "rules/rseqc.smk"
+#include: "rules/get_miclip_data.smk"
+include: "rules/umitools.smk"

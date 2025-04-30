@@ -1,0 +1,4253 @@
+---
+title: "m6A-mediated decay: analsis of human data"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+---
+
+# Prerequisites
+
+Set up the workflow.
+
+```{r setup}
+
+############
+analysisID = "m6A_decay_tRNA"
+############
+
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(Hmisc)
+  library(readxl)
+  library(doParallel)
+  library(stringr)
+  library(zoo)
+  library(yaml)
+  library(purrr)
+  library(digest)
+  library(dineq)
+  
+  library(rtracklayer)
+  library(seqinr)
+  library(biomaRt)
+  library(Rsamtools)
+  library(Biostrings)
+  library(BSgenomeForge)
+  library(txdbmaker)
+  library(GenomicFeatures)
+  library(GenomicAlignments)
+  library(hiAnnotator)
+  library(Rsubread)
+  library(ProliferativeIndex)
+  library(msigdbr)
+  
+  library(org.Hs.eg.db)
+
+  #library(colorspace)
+  library(RColorBrewer)
+  library(ggpubr)
+  library(ggrepel)
+  library(ggnewscale)
+  library(ggbeeswarm)
+  library(ggpattern)
+  #library(scales)
+  #library(GGally)
+  library(ggh4x)
+  library(ggpmisc)
+
+})
+
+for(file in list.files("../R_codebase/", "*.R$", full.names = TRUE)){source(file)}
+
+###
+### genome setup
+###
+
+genomeDir = "~/genomes/homo_sapiens_GRCh38_v35"
+fastaFile = file.path(genomeDir, "genome.fasta")
+txFile = file.path(genomeDir, "annotation.gtf")
+
+###
+### output setup
+###
+
+tmpDir = file.path("/scratch/linder", analysisID)
+if(!dir.exists(tmpDir)){dir.create(tmpDir, recursive = T)}
+
+figDir = "../results/analysis_human/"
+if(!dir.exists(figDir)){dir.create(figDir, recursive = T)}
+
+```
+
+```{r parameters}
+
+exlenbins = 17
+decay_shift_ntiles = 100/5
+
+```
+
+```{r definitions}
+
+drach_codons <- c("AAA", "GAA", "TAA", "AGA", "GGA", "TGA", "GAC", "AAC", "ACA", "ACC", "ACT")
+stop_codons <- c("TGA", "TAA", "TAG")
+mcm5s2U_codons   = c("CAA", "AAA", "AGA", "GAA")
+elongator_codons = c("TTA", "GTA", "TCA", "CCA", "ACA", "GCA", "CAA", "AAA", "GAA", "AGA", "GGA") # from Johansson, Byström (2018). BBA 1861, 401–408.
+queuosine_codons = c("GAC", "AAC", "TAC", "CAC", "GAT", "AAT", "TAT", "CAT")
+
+```
+
+```{r palettes}
+
+palval_m6A_region = c(none = "grey", utr5 = "#FFCC00", cds = "#669966", utr3 = "#993366", both = "grey80") 
+
+palval_m6A_region_fill         = c(none = "grey", utr5 = "#FFCC00", cds = "#669966", utr3 = "#993366", cdsutr3 = "#669966")
+palval_m6A_region_fill_pattern = c(none = NA, utr5 = NA, cds = NA, utr3 = NA, cdsutr3 = "#993366")
+
+palval_exbin  = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(exlenbins) ## diverging palette
+
+palval_drach_status = c("all" = "black", "other" = "grey", "no DRACH" = "#4575B4", "DRACH" = "orange", "m6A" = "#D73027")
+
+
+palval_reporter = c("none" = "grey40", "C1" = "#9A3367", "C2" = "#669965", "C3" = "#00a19a", "C4" = "#36a9e1", "C5" = "#fcdd2e", "C6" = "#00a19a", "C7" = "#6691cb" )
+palval_reporter_codons = palval_reporter
+names(palval_reporter_codons) = sedit(names(palval_reporter_codons), c("C2", "C5"), c("AGA", "GGA"))
+
+palval_genotype <-
+  c(  "WT"      = "grey40"
+    , "ELP1 KO" = "#8DCA46"   # "#4b8bc0"
+    , "CTU2 KO" = "#BC6CA7"   # "#842976"   #"#ffd95c"   # "#FF206E" 
+    ) 
+
+palval_m6A_inh = c("mock" = "grey40", "STM" = "orange")
+
+palval_transl_inh = c("mock" = "grey40", "EM" = "#00cccc", "CHX" = "#00afcc")
+
+palval_sets = c(m6A     = "#FFDE0D",
+                m6A_neg = "grey80",
+                mcm5    = "grey60",
+                s2U     = "#6E94CD",
+                ngd     = "blue",
+                yth     = "orange",
+                proliferation = "#F8766D",
+                ribosomal = "#F8766D"
+                )
+
+palval_queosine <-
+  c("WT" = "grey40",
+    "QTRT1 KO" = "#e3e3ff",
+    "QTRT2 KO" = "#c2c2ff",
+    "QTGAL KO" = "#ffc7c7",
+    "QTMAN KO" = "#cbe5c3")
+
+```
+
+```{r labellers}
+
+labeller_reporter = c("none" = "untransfected", "C4" = "no~m^6*A", "C7" = "CAA", "C2" = "CDS", "C6" = "GAA", "C5" = "GGA", "C1" = "`3'UTR`" ) ## "#00a19a" 
+
+labeller_reporter_codons = labeller_reporter
+labeller_reporter_codons["C2"] = "AGA"
+
+```
+
+```{r functions}
+
+get_codon_strength <-
+  function(codon){
+    ## from: Grosjean & Westhof 2016
+    strength = rep(NA, length(codon))
+    strength = ifelse(grepl("[GC][GC].", codon), "strong", strength)
+    strength = ifelse(grepl("([GC][AT].)|([AT][GC].)", codon), "intermediate", strength)
+    strength = ifelse(grepl("[AT][AT].", codon), "weak", strength)
+    strength = factor(strength, levels = c("weak", "intermediate", "strong"))
+    return(strength)
+  }
+
+get_codon_tRNA_mod <-
+  function(codon){
+    mod = rep("other", length(codon))
+    mod[codon %in% c("ACA", "CCA", "GCA", "GGA", "GTA", "TCA", "TTA")] = "mcm5U"
+    mod[codon %in% c("AAA", "GAA", "AGA", "CAA")] = "mcm5s2U"
+    mod[codon %in% c("TAA", "TAG", "TGA")] = "stop"
+    mod = factor(mod, levels = c("other", "mcm5U", "mcm5s2U", "stop"))
+    return(mod)
+  }
+
+saf_from_grl <-
+  function(grl){
+    gr = unlist(grl)
+    saf = data.table(GeneID = as.character(names(gr)),
+                     Chr = as.character(seqnames(gr)),
+                     Start = as.integer(start(gr)),
+                     End = as.integer(end(gr)),
+                     Strand = as.character(strand(gr)) )
+    return(saf)
+    
+  }
+
+
+exbinMarkerBar <-
+  function(m6A_fill_levels = 17){
+    list(
+    new_scale_fill(),
+    geom_rect(aes(xmin = as.integer(exbin)-0.5,
+                  xmax = as.integer(exbin)+0.5,
+                  ymin = min(..y..) - ((max(..y..)-min(..y..))*0.05)*2.5,
+                  ymax = min(..y..) - (max(..y..)-min(..y..))*0.05,
+                  fill = exbin),
+              col = NA, show.legend = FALSE),
+    scale_fill_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(m6A_fill_levels))
+    )
+  }
+
+geom_decay_line <-
+  function(by = NULL) {
+    geom_line(data = function(x){
+      x[, predict_decay(fit_decay(
+        .SD, method = "nls", time_col = "time_num")$coef,
+        timepoints = seq(0,4,0.2), time_col = "time_num"),
+        by = by]})
+  }
+
+geom_decay_text <-
+  function(by = NULL, vjust_var = NULL, size = 4) {
+    geom_text(data = function(x){
+      x[, fit_decay(
+        .SD, method = "nls", time_col = "time_num")$coef[, t12 := log(2)/k],
+        by = by][, vj := if(is.null(vjust_var)){1}else{as.integer(factor(get(vjust_var)))}]},
+      aes(label = paste0(#"t[1/2]==", 
+                         round(t12, 1), "*h"), vjust = vj*1.05 ), x = Inf, y = Inf, hjust = 1, parse = TRUE, show.legend = FALSE, size = size)
+  }
+
+
+## function for reading Jie's riboseq coverage files
+read_tx_coverage <-
+  function(coverage_file, file_suffix){
+    data <-
+      fread(coverage_file, sep = "\t", sep2 = ",", header = FALSE)[
+        , .(codon_rank = as.integer(1:(V2+1)), coverage = as.numeric(str_split_1(V3, ",")) )
+        , by = .(ensembl_transcript_id = str_split_i(V1, "\\|", 2), cds_len_cods = V2 )]
+    setnames(data, "coverage", gsub(file_suffix, "", basename(coverage_file)))
+    setnames(data, gsub("^PSLib[0-9]+_RPF_", "", names(data)))
+  }
+
+## wrapper to get coverage objects
+get_tx_coverage <-
+  function(experiment_name, file_path, file_suffix, combine = "intersect"){
+    
+    coverage_files = list.files(path = file_path, pattern = file_suffix, full.names = TRUE)
+    if(length(coverage_files) == 0){stop("No files found!")}else(cat(paste("Reading", length(coverage_files), "files.\n")))
+
+    ## read in data
+    coverage <-
+      foreach(coverage_file = coverage_files) %do% {
+        read_tx_coverage(coverage_file, file_suffix)
+      }
+    
+    ## track how many genes have coverage
+    coverage_genes <-
+      lapply(coverage, function(x){x[, unique(ensembl_transcript_id) ]})
+    names(coverage_genes) = gsub(file_suffix, "", basename(coverage_files))
+    
+    ## define combine method
+    if(combine == "union"){
+      cat("Using union for gene merging.\n")
+      coverage <-
+        Reduce(f = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = TRUE)}, x = coverage)
+    }else if(combine == "intersect"){
+      cat("Using intersection for gene merging.\n")
+      coverage <-
+        Reduce(f = function(x,y){merge(x,y, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = FALSE)}, x = coverage)
+    }else{
+      cat("Error: Undefined method for gene merging. Use 'union' or 'intersect'. \n")
+      stop()
+    }
+    
+
+
+    meta <-
+      data.table(experiment = experiment_name, run = setdiff(names(coverage), c("ensembl_transcript_id", "cds_len_cods", "codon_rank")) )
+    
+    
+    return(list(file_suffix = file_suffix, coverage = coverage, coverage_genes = coverage_genes, meta = meta))
+    
+  }
+
+
+
+```
+
+# Transcript model
+
+Generate the transcipt model for convenient analysis.
+
+```{r canonical_transcripts}
+
+canonical_transcripts <- 
+  getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "transcript_is_canonical", "hgnc_symbol"),
+        filters = "transcript_is_canonical",
+        values = TRUE,
+        mart = useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 113, verbose = TRUE))
+
+canonical_transcripts = as.data.table(canonical_transcripts)
+setnames(canonical_transcripts, "hgnc_symbol", "gene")
+
+head(canonical_transcripts)
+
+```
+
+```{r}
+# getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "transcript_is_canonical"),
+#         filters = "transcript_is_canonical",
+#         values = TRUE,
+#         mart = useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl"))
+```
+
+```{r gtf}
+
+gtf <-
+  import(con = txFile)
+
+gtf_dt <-
+  as.data.table(mcols(gtf))[, c("chrom", "start", "end") := .(as.character(seqnames(gtf)), start(gtf), end(gtf)) ]
+
+gtf_dt[, ensembl_transcript_id := gsub("\\..*$", "", transcript_id)]
+gtf_dt[, ensembl_gene_id := gsub("\\..*$", "", gene_id)]
+gtf_dt[, gene := gene_name]
+
+head(gtf_dt)
+
+```
+
+```{r BSgenome}
+
+bsg  <-
+  create_BSgenome(fastaFile = fastaFile, organism = "Homo sapiens", genome = "hg38")
+
+bsg
+
+```
+
+```{r txdb}
+
+txdbFile = file.path(dirname(txFile), paste0(basename(txFile), ".txdb.RData"))
+# file.remove(txdbFile)
+if (!file.exists(txdbFile)) {
+  txdb <-
+   makeTxDbFromGFF(txFile, format = "gtf")
+  saveDb(x = txdb, file = txdbFile)
+} 
+
+txdb <- loadDb(txdbFile)
+
+txdb
+```
+
+```{r txmodel}
+ 
+txdatfile = file.path(dirname(txFile), paste0(basename(txFile),".txdat.RData"))
+# file.remove(txdatfile)
+if(!file.exists(txdatfile)){
+cat("Generating txmodel...")
+  txdat <-
+    get_txdat_from_gtf(txFile)
+    save(txdat, file = txdatfile )
+    cat(" ...done.\n")
+  }else{cat("Loading txmodel..."); load(txdatfile);cat(" ...done.\n") }
+
+txmodel = txdat$txmodel
+
+txmodel[, is_canonical := gsub("\\..*$", "", tx_name) %in% canonical_transcripts$ensembl_transcript_id]
+
+txmodel[! is.na(cds_len) & is_canonical, is_longest_cds := {
+    ## pick the longest CDS (in case of equal length, we simply pick the first)
+    x = cds_len == max(cds_len, na.rm = TRUE)
+    hit = min(which(x))
+    x = rep(FALSE, length(x))
+    x[hit] = TRUE
+    x
+  }, by = .(gene_id) ]
+
+txmodel[, is_protein_coding := gene_id %in% gtf_dt[gene_biotype == "protein_coding", unique(gene_id)] ]
+
+txmodel[, is_QC_pass := utr5_len > 10 & cds_len  > 60 & cds_len < 10000 & utr3_len > 60]
+
+txmodel <-
+  txmodel[is_canonical & is_protein_coding & is_longest_cds & is_QC_pass]
+
+cat(
+  paste(
+    "Filtering for valid transcripts leaves", nrow(txmodel), "out of", nrow(txdat$txmodel), "transcripts.\n"
+  )
+)
+
+stopifnot(txmodel[, length(gene_id) == length(unique(gene_id))])
+
+txmodel[, ensembl_gene_id := gsub("\\..*$", "", gene_id)]
+txmodel[, gene := setkeyv(gtf_dt[, .(ensembl_gene_id, gene)][, unique(.SD)], "ensembl_gene_id")[ensembl_gene_id, gene]]
+txmodel[, exlen := unlist(lapply(cds_exon_len, mean, na.rm=TRUE))] ## get mean CDS exon lenth per transcript
+txmodel[, exlen_max := unlist(lapply(cds_exon_len, max, na.rm=TRUE))] ## get mean CDS exon lenth per transcript
+
+head(txmodel)
+
+```
+
+```{r txmodel gini}
+require(dineq)
+
+txmodel[, cds_exon_length_gini := unlist(txmodel[, lapply(cds_exon_len, gini.wtd)])]
+
+head(txmodel[, .(cds_exon_length_gini = median(cds_exon_length_gini)), by = "gene_id"])
+
+```
+
+```{r ex_by_tx}
+
+ex_by_tx <-
+  txdat$ex_by_tx[names(txdat$ex_by_tx) %in% as.character(txmodel$tx_name)]
+
+ex_by_tx
+
+```
+
+```{r exlenTabGene}
+
+exlenTabGene <-
+  txmodel[, .(exlen = mean(exlen, na.rm=T),      ## get mean CDS exon length per gene
+              exlen_max = max(exlen_max, na.rm = TRUE), 
+              tx_len = mean(tx_len, na.rm=T),  ## get mean tx length per gene
+              utr5_len = mean(utr5_len, na.rm=T),  ## get mean utr5 length per gene
+              cds_len = mean(cds_len, na.rm=T),  ## get mean CDS length per gene
+              utr3_len = mean(utr3_len, na.rm=T),  ## get mean utr3 length per gene 
+              nexon = mean(nexon, na.rm=T),       ## get mean number of exons per gene
+              cds_exon_length_gini = mean(cds_exon_length_gini, na.rm = TRUE)
+              ), by=c("gene_id", "ensembl_gene_id", "gene")] 
+
+
+## remove olfactory receptor genes
+exlenTabGene = exlenTabGene[!grepl("^OR[0-9]+", gene)]
+
+exlenTabGene[, exbin := cut2((exlen), g = exlenbins, digits = 1)]
+exlenTabGene[, exrank := rank(exlen, ties.method = "random")]
+exlenTabGene[, longer_than_median := exlen > median(exlen) ]
+
+ggplot(exlenTabGene, aes(x = exlen)) +
+  # geom_density(alpha = 0.3, aes(fill = exbin), col = NA) +
+  geom_histogram(bins = 200, alpha = 1, aes(fill = exbin, group=exbin), col = NA) +
+  
+  geom_vline(xintercept = median(exlenTabGene$exlen, na.rm=T), linetype=2, col = "blue") +
+  geom_text(aes(median(exlenTabGene$exlen, na.rm=T), Inf, label = round(median(exlenTabGene$exlen, na.rm=T), digits = 1)), col = "blue", vjust=1, check_overlap = T) +
+  
+  geom_vline(xintercept = mean(exlenTabGene$exlen, na.rm=T), linetype=2, col = "red") +
+  geom_text(aes(mean(exlenTabGene$exlen, na.rm=T), Inf, label = round(mean(exlenTabGene$exlen, na.rm=T), digits = 1)), col = "red", vjust=1, check_overlap = T) +
+  
+  scale_x_continuous(trans='log10', limits= c(50, 5000)) +
+  annotation_logticks(base = 10, sides = "b") +
+  
+  labs( fill = "CDS exon length bin", y = "Gene count", x = "Gene average CDS exon length [nt]") +
+  scale_fill_manual(values = palval_exbin) +
+  theme_pubr() +
+  guides(fill=guide_legend(ncol=3)) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position=c(0.7, 0.6)) +
+  NULL
+
+```
+
+```{r eejs.tx}
+## Get EEJ coordinates. We use the first nucleotide of all exons that are not the first exon.
+ex <-
+  unlist(ex_by_tx, use.names = F)
+
+eejs <-
+  unique(resize(ex[ex$exon_rank != 1], 1, "start"))
+
+eejs.tx <-
+  mapToTranscripts(x = eejs, transcripts = ex_by_tx)
+strand(eejs.tx) = "+"
+
+eejs.tx$exon_name <-
+  eejs[eejs.tx$xHits]$exon_name
+
+eejs.tx$exlen  <-
+  width(ex)[match(eejs.tx$exon_name, ex$exon_name)]
+
+eejs.tx$frame <-
+  get_frame(eejs.tx, txmodel)
+
+eejs.tx$relpos.cds <-
+  relpos.cds.gr(eejs.tx)
+
+eejs.tx$region <-
+  get_region(eejs.tx, txmodel)
+
+eejs.tx
+
+# for QC in IGV
+# export(object = eejs, con = gzfile("~/eejs.bed.gz"),format = "bed")
+# export(object = ex_by_tx, con = gzfile("~/exbytx.bed.gz"),format = "bed")
+
+#ggplot(as.data.frame(mcols(eejs.tx)), aes(x=frame, fill = factor(exlen %% 3) )) + geom_bar(position="dodge")
+
+```
+
+```{r ex_on_tx}
+require(Hmisc)
+
+## Adjust exons to CDS start and stop.
+## Generate GRanges of CDS exons in tx space. The start and end coordinates of exons spanning the start and stop codons are adjusted to match those features.
+
+## GRanges of individual exons
+ex.gr <-
+  unlist(ex_by_tx)
+## we only need each exon once and remove exons w/o name (e.g spike-ins)
+ex.gr <-
+  ex.gr[ ! duplicated(ex.gr$exon_name) & ! is.na(ex.gr$exon_name)] 
+## map exons to transcript space
+ex_on_tx <-
+  mapToTranscripts(ex.gr, ex_by_tx) 
+## annotate
+mcols(ex_on_tx) <-
+  mcols(ex.gr[ex_on_tx$xHits]) 
+## test for exons that have not been mapped on transcripts
+stopifnot(sum(!ex.gr$exon_name %in% unique(ex_on_tx$exon_name)) == 0)
+## as we use txmodel to annotate, remove tx not in txmodel
+ex_on_tx <-
+  ex_on_tx[seqnames(ex_on_tx) %in% txmodel$tx_name]
+## remove exons in UTRs
+ex_on_tx <-
+  ex_on_tx[ ! start(ex_on_tx) >= txmodel$utr3.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)]]
+ex_on_tx <-
+  ex_on_tx[ ! end(ex_on_tx) <= txmodel$cds.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)]]
+
+## restrict exon boundaries to CDS
+start(ex_on_tx) <-
+  ifelse(test = start(ex_on_tx) < txmodel$cds.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)] &  ## on exons spanning the start codon
+                  end(ex_on_tx) > txmodel$cds.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)],  
+         yes  = txmodel$cds.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)], ## replace start with first nucleotide of CDS
+         no   = start(ex_on_tx)) ## else leave exon start
+
+end(ex_on_tx) <-
+  ifelse(test =   end(ex_on_tx) > txmodel$utr3.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)] &  ## on exons spanning the stop codon
+                start(ex_on_tx) < txmodel$utr3.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)],  
+         yes  = txmodel$utr3.start[match(as.character(seqnames(ex_on_tx)), txmodel$tx_name)] -1 , ## replace end with last nucleotide of CDS
+         no   = end(ex_on_tx)) ## else leave exon end
+
+## exon length bins
+ex_on_tx$exlen <-
+  width(ex_on_tx)
+ex_on_tx$exbin <-
+  cut2(ex_on_tx$exlen, g = exlenbins)
+
+ex_on_tx
+
+## map back to genome space
+ex_on_gn <-
+  mapFromTranscripts(ex_on_tx, ex_by_tx)
+mcols(ex_on_gn) <-
+  mcols(ex_on_tx[ex_on_gn$xHits])
+
+```
+
+```{r drach.tx}
+
+## get reference sequence
+seqlevelsStyle(bsg) = seqlevelsStyle(ex_by_tx)
+tx.seqs = extractTranscriptSeqs(bsg, keepStandardChromosomes(ex_by_tx, pruning.mode = "coarse"))
+
+## get drach motifs
+drach.tx <-
+  GRanges(vmatchPattern("DRACH", tx.seqs, fixed = F)) - 2 # center on A
+
+## annotate
+drach.tx$kmer <-
+  getSeq(tx.seqs, drach.tx + 2)
+drach.tx$relpos.cds <-
+  relpos.cds.gr(drach.tx)
+drach.tx$region <-
+  get_region(drach.tx, txmodel)
+drach.tx$region = factor(drach.tx$region, levels = c("utr5", "cds", "utr3") )
+drach.tx$frame <-
+  get_frame(drach.tx, txmodel = txmodel)
+drach.tx$codon = substr(drach.tx$kmer, 3 - as.numeric(as.character(drach.tx$frame)) , 3 - as.numeric(as.character(drach.tx$frame)) + 2 )
+
+drach.tx
+
+```
+
+```{r cods.gr}
+
+codsID <-
+  digest(c(get_codon_gr, txmodel, tx.seqs, eejs.tx, drach.tx, ex_on_tx))
+
+codsFile = file.path(tmpDir, paste0("codon_GRanges.", codsID, ".RData") )
+
+require(doParallel)
+registerDoParallel(cores = 6)
+system.time(
+if(!file.exists(codsFile)){
+  cat("Generating cods.gr...")
+  cods.gr <- 
+    get_codon_gr(txmodel = txmodel, tx.seqs = tx.seqs, eejs.tx = eejs.tx, drach.tx = drach.tx, ex_on_tx = ex_on_tx)
+  saveRDS(cods.gr, codsFile)
+  cat(" ...done.\n")
+}else{cat("Loading cods.gr..."); cods.gr <- readRDS(codsFile); cat(" ...done.\n")}
+)
+registerDoParallel(cores = 1)
+
+cods.gr$codon_rank_from_stop = as.data.table(cods.gr)[, codon_rank - max(codon_rank), by = .(seqnames)][[2]]
+
+cods.gr$codon_strength <- get_codon_strength(cods.gr$codon)
+cods.gr$codon_tRNA_mod <- get_codon_tRNA_mod(cods.gr$codon)
+
+cods.gr
+
+```
+
+```{r geneset}
+
+geneset <-
+  get_geneset(dict = unique(canonical_transcripts$gene))
+
+geneset
+
+```
+
+```{r msig}
+
+msigDT <-
+  as.data.table(msigdbr(species = "Homo sapiens"))
+msigDT[, gene := gene_symbol]
+
+msigList <-
+  split(x = msigDT$gene, f = msigDT$gs_name)
+
+msigList[["CUSTOM_DIFFERENTIATION"]] <-
+  sort(unique(unlist(msigList[grepl("DIFFERENTIAT", names(msigList))])))
+  
+msigList[["CUSTOM_PROLIFERATION"]] <-
+  sort(unique(unlist(msigList[grepl("PROLIFERAT", names(msigList))])))
+
+msigList[["CUSTOM_METABOLISM"]] <-
+  sort(unique(unlist(msigList[grepl("METABOLI", names(msigList))])))
+
+## create unambiguous subsets of genes not in the other groups
+for(gc in grep("CUSTOM", names(msigList), value = TRUE)) {
+  msigList[[gc]] <-
+    setdiff(msigList[[gc]], unlist(msigList[setdiff(grep("CUSTOM", names(msigList), value = TRUE), gc) ]))
+  }
+
+lapply(msigList[grep("CUSTOM|GOCC_DNA_PACKAGING_COMPLEX", names(msigList))], length)
+
+
+## geneset categories
+gs_signaling = msigDT[grepl("HALLMARK|KEGG", gs_name) & grepl("SIGNALING|RESPONSE", gs_name) & !grepl("_UP$|_DN$|UNFOLDED", gs_name), unique(gs_name) ]
+gs_metabolic = msigDT[grepl("HALLMARK|KEGG", gs_name) & grepl("METABOLISM|GLYCOLYSIS|SECRETION|OXYGEN|OXIDATIVE|CHOLESTEROL", gs_name), unique(gs_name) ]
+gs_select = grep("TGF|TNF|NOTCH|MYC|OXIDATIVE|SECRETION|FATTY|INFLAMMATORY_RESPONSE", c(gs_signaling, gs_metabolic), value = TRUE)
+
+genes_histones = grep("^H", msigList$GOCC_DNA_PACKAGING_COMPLEX, value = TRUE)
+
+```
+
+# Data
+
+Collect data from various sources.
+
+## --- m6A sites --- 
+
+### miCLIP
+
+Read in the BED file of DRACH sites called by the miCLIP pipeline in analysis_miCLIP.Rmd These are the miCLIP sites. After running the snakemake workflow, these need to be called using the separate R norebook "analysis_miCLIP.Rmd".
+
+```{r read c2t}
+
+## read c2t
+miCLIPfile = "../results/analysis_miCLIP/miclip_c2t.bed"
+
+c2t <-
+  import.bed(miCLIPfile)
+
+c2t$siteID = 1:length(c2t)
+
+c2t$call <-
+  gsub("_.*$", "", c2t$name)
+
+c2t$is_m6A <-
+  c2t$call == "methylated"
+
+c2t$cvg <-
+  as.integer(gsub("cvg","",do.call(rbind, strsplit(c2t$name, split ="_"))[,2]))
+  
+c2t$nC <-
+  as.integer(gsub("c","",do.call(rbind, strsplit(c2t$name, split ="_"))[,3]))
+
+c2t$nT <-
+  as.integer(gsub("t","",do.call(rbind, strsplit(c2t$name, split ="_"))[,4]))
+
+c2t$c2t <- c2t$nT / c2t$nC
+
+## map to transcripts
+c2t.tx <-
+  mapToTranscripts(x = c2t, transcripts =  ex_by_tx)
+strand(c2t.tx) = "+"
+
+mcols(c2t.tx) <-
+  cbind(mcols(c2t.tx), mcols(c2t)[c2t.tx$xHits,])
+
+c2t.tx$relpos.cds <-
+  relpos.cds.gr(c2t.tx)
+
+c2t.tx$frame <-
+  get_frame(c2t.tx, txmodel = txmodel)
+
+c2t.tx$region <- 
+  factor(get_region(c2t.tx, txmodel), levels = c("utr5", "cds", "utr3"))
+  # merge(data.table( tx_name = as.character(seqnames(c2t.tx)), start = start(c2t.tx)), txmodel, "tx_name", all.x = TRUE)[, region := ifelse(test = start < cds.start, yes = "utr5", no = ifelse(test = start >= cds.start & start < utr3.start, yes = "cds", no = ifelse(test = start >= utr3.start, yes = "utr3", no = NA )))]$region
+
+# c2t.tx$framelabel <- 
+#   get_framelabel(frame = c2t.tx$frame)
+
+c2t.dt <-
+  cbind(data.table("tx_name" = as.character(seqnames(c2t.tx))), as.data.table(mcols(c2t.tx)))
+
+c2t.dt[, ensembl_transcript_id := gsub("\\..*$", "", tx_name)]
+
+c2t.dt[, ensembl_gene_id := setkeyv(gtf_dt[!is.na(ensembl_transcript_id), unique(.SD)], "ensembl_gene_id")[ensembl_transcript_id, ensembl_gene_id]]
+
+head(c2t.dt)
+
+```
+
+```{r}
+c2t.dt[(is_m6A), .N, by = "region"]
+```
+
+```{r define miCLIP m6A codons}
+### annotate with called m6A from integrated miCLIP
+cods.gr$is_m6A <-
+  suppressWarnings(overlapsAny(cods.gr, c2t.tx[c2t.tx$is_m6A]))
+
+### codon-matched control sites in same CDSs as m6A
+cods.gr$matched_status <-
+  get_codon_matched_sites(cods.gr = cods.gr)
+
+### status of all DRACH codons in transcriptome (is_m6A, is_drach or not DRACH)
+cods.gr$drach_status <-
+  get_drach_status(cods.gr = cods.gr, m6A_var = "is_m6A")
+
+cat("miCLIP m6A sites:")
+table(cods.gr$is_m6A)
+cat("CDS matched status:")
+table(cods.gr$matched_status)
+cat("DRACH status:")
+table(cods.gr$drach_status)
+
+```
+
+```{r lift c2t to codons}
+
+### annotate with miCLIP info
+cods.c2t.hits <-
+  suppressWarnings(findOverlaps(query = cods.gr, subject = c2t.tx ))
+cods.gr$c2t <- as.numeric(NA)
+cods.gr[queryHits(cods.c2t.hits)]$c2t <-
+  c2t.tx[subjectHits(cods.c2t.hits)]$c2t
+
+cods.gr$cvg <- as.integer(NA)
+cods.gr[queryHits(cods.c2t.hits)]$cvg <-
+  c2t.tx[subjectHits(cods.c2t.hits)]$cvg
+
+cods.gr$nC<- as.integer(NA)
+cods.gr[queryHits(cods.c2t.hits)]$nC <-
+  c2t.tx[subjectHits(cods.c2t.hits)]$nC
+
+cods.gr$nT<- as.integer(NA)
+cods.gr[queryHits(cods.c2t.hits)]$nT <-
+  c2t.tx[subjectHits(cods.c2t.hits)]$nT
+
+head(cods.gr,3)
+
+```
+
+```{r lift c2t to drach}
+
+drach.tx$is_m6A_miCLIP <-
+  suppressWarnings(overlapsAny(drach.tx, c2t.tx[c2t.tx$is_m6A]))
+
+### annotate with miCLIP info
+drach.c2t.hits <-
+  suppressWarnings(findOverlaps(query = drach.tx, subject = c2t.tx ))
+drach.tx$c2t <- as.numeric(NA)
+drach.tx[queryHits(drach.c2t.hits)]$c2t <-
+  c2t.tx[subjectHits(drach.c2t.hits)]$c2t
+
+
+head(drach.tx,3)
+
+```
+
+## --- m6A levels ---
+
+### GLORI
+
+Liu, C., Sun, H., Yi, Y., Shen, W., Li, K., Xiao, Y., Li, F., Li, Y., Hou, Y., Lu, B., et al. (2022). Absolute quantification of single-base m6A methylation in the mammalian transcriptome using GLORI. Nat Biotechnol, 1–12. 10.1038/s41587-022-01487-9.
+
+```{r}
+glori  <-
+  within(list(), {
+    dataURL = "https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-022-01487-9/MediaObjects/41587_2022_1487_MOESM3_ESM.xlsx"
+    dataFile = file.path(tmpDir, basename(dataURL))
+    if(!file.exists(dataFile)){download.file(dataURL, dataFile)}
+    dt = as.data.table(read_xlsx(dataFile))
+    dt[, m6A_lvl := rowMeans(cbind(m6A_level_rep1, m6A_level_rep2))]
+    gr = dt[, GRanges(seqnames = Chr, ranges = IRanges(start = Sites, width = 1), strand = Strand, m6A_lvl, score = m6A_lvl)]
+    
+    ## map to transcripts
+    tx <-
+      mapToTranscripts(x = gr, transcripts =  ex_by_tx)
+    strand(tx) = "+"
+    mcols(tx) <-
+      cbind(mcols(tx), mcols(gr)[tx$xHits,])
+    tx$relpos.cds <-
+      relpos.cds.gr(tx)
+    tx$frame <-
+      get_frame(gr = tx, txmodel = txmodel)
+    tx$region <-
+      factor(get_region(tx, txmodel), levels = c("utr5", "cds", "utr3"))
+    tx$kmer <-
+      # get_kmer(gr = trim(tx + 2), tx.seqs)
+      getSeq(tx.seqs, trim(tx + 2))
+    
+  })
+
+glori$dt
+glori$gr
+glori$tx
+
+```
+
+```{r lift GLORI to codons}
+
+## define position of m6A in codons to use with GRanges resize()
+codon_m6A_pos <-
+  c(
+    ## DRACH codons
+    "AAA" = "end",
+    "AGA" = "end",
+    "GAA" = "end",
+    "GGA" = "end",
+    "AAC" = "center",
+    "GAC" = "center",
+    "ACA" = "start",
+    "ACC" = "start",
+    "ACT" = "start",
+    ## non-DRACH codons
+    "ACG" = "start",
+    "ATT" = "start",
+    "GTA" = "end",
+    "CAA" = "end",
+    ## stop codons
+    "TGA" = "end",
+    "TAG" = "center" 
+    )
+
+## findOverlaps on codons resized to their m6A position (codons that are not a DRACH codon get resized to width 0)
+
+cods.gr.glori.hits <-
+  findOverlaps(query = resize(cods.gr,
+                              ifelse(cods.gr$codon %in% names(codon_m6A_pos), 1, 0),
+                              ifelse(cods.gr$codon %in% names(codon_m6A_pos), codon_m6A_pos[cods.gr$codon], "start") ),
+             subject = glori$tx )
+## assign metadata columns
+cods.gr$glori_m6A_lvl = as.numeric(0)
+cods.gr[queryHits(cods.gr.glori.hits)]$glori_m6A_lvl <-
+  glori$tx[subjectHits(cods.gr.glori.hits), ]$m6A_lvl
+
+cods.gr$gloribin = relevel(factor(ifelse(cods.gr$glori_m6A_lvl == 0, "[0]", as.character(cut2(cods.gr$glori_m6A_lvl,cuts = seq(0,1,0.1)))  ) ), "[0]")
+
+#cods.gr$glori_m6A_lvl_stm = as.numeric(NA)
+# cods.gr[queryHits(cods.gr.glori.hits)]$glori_m6A_lvl_stm <-
+#   glori_stm$tx[subjectHits(cods.gr.glori.hits), ]$m6A_lvl_stm
+
+
+```
+
+```{r check glori DRACH, fig.height = 6, fig.width = 4}
+
+as.data.table(glori$tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , {cbind(N=.N, mean_se(m6A_lvl))}
+    , by = .(is_DRACH)
+  ]
+
+as.data.table(glori$tx)[
+    , is_DRACH := grepl("[AGT][AG]AC[ACT]", kmer)
+  ][
+    , {cbind(N=.N, mean_sd(m6A_lvl*100))}
+    , by = .(kmer, is_DRACH = ifelse(is_DRACH, "DRACH", "other") )
+  ][
+    order(-N)
+    , 
+    ][
+      N > 100 & nchar(kmer) == 5
+    ][
+      ,
+      ggarrange(
+      ggplot(.SD,
+             aes(x = factor(kmer, levels = unique(kmer[order(N)])),
+                 y = N,
+                 fill = is_DRACH)) +
+        geom_col() +
+        coord_flip() +
+        scale_y_continuous(trans = "log10") + annotation_logticks(sides = "b") +
+        theme_bw() +
+        theme(axis.text.y = element_text(family = "Courier",size = 7, hjust =0.5)) +
+        labs(x = "Motif", y = "Sites [N]", fill = "")
+      ,
+      ggplot(.SD,
+             aes(x = factor(kmer, levels = unique(kmer[order(N)])),
+                 y = y,
+                 col = is_DRACH)) +
+        geom_errorbar(aes(ymin=ymin, ymax=ymax), width = 0) +
+        geom_point() +
+        coord_flip() +
+        theme_bw() +
+        theme(axis.text.y = element_blank(), axis.title.y = element_blank()) +
+        labs(y = "Avg. m6A level [%]"),
+      ncol = 2, common.legend = TRUE
+      )
+    ]
+
+```
+
+```{r lift glori to DRACH}
+
+drach.tx.glori.hits <-
+  suppressWarnings(findOverlaps(query = drach.tx, subject = glori$tx))
+
+drach.tx$glori_m6A_lvl <- as.numeric(0)
+
+drach.tx[queryHits(drach.tx.glori.hits)]$glori_m6A_lvl <-
+  glori$tx[subjectHits(drach.tx.glori.hits)]$m6A_lvl
+
+```
+
+```{r gloribins}
+
+gloribins <-
+  glori$dt[Gene != "ELSE", .(glori_m6A_lvl = sum(m6A_lvl)), by = .(gene = Gene)][
+    , gloribin := cut2(glori_m6A_lvl, g= 50)
+  ][
+  ]
+
+
+
+gloribins[
+  , merge(.SD, exlenTabGene, "gene")
+][
+  , ggplot(.SD, aes(x = gloribin, y = glori_m6A_lvl)) +
+    geom_boxplot()
+]
+
+gloribins[
+  , merge(.SD, exlenTabGene, "gene")
+][
+  , ggplot(.SD, aes(x = gloribin, y = exlen)) +
+    geom_boxplot() +
+    coord_cartesian(ylim = c(NA, 2000))
+]
+
+```
+
+## --- decay rates ---
+
+### Collect data
+
+#### mcm5s2U SLAM-Seq
+
+These are the SLAM-Seq datasets. They need to be generated using the "gedi" part or the snakemake workflow or downloaded from GEO.
+
+```{r mcm5s2U_SLAM}
+
+mcm5s2U_SLAM <-
+  within(list(), {
+    ## initial setup
+    gse = NA
+    experiment_name = "mcm5s2U_quantseq"
+    samples = fread("../samples.mcm5s2U_quantseq.tsv")
+    
+    config  = yaml::read_yaml("../config.mcm5s2U_quantseq.yaml")
+    genome  = "homo_sapiens_GRCh38_v35_ERCC92"
+    
+    ## sample metadata
+    meta = samples[, c("run", "title")]
+    
+    meta[, label_type := "4sU"]
+    meta[, label_conc := "100"]
+    meta[, label_time := str_extract(title, "[0-9]+h")]
+    meta[grepl("0IAA", run), label_time := "0h"]
+    meta[grepl("100IAA", run), label_time := "4h"]
+    meta[, label_time  := factor(label_time, levels = gtools::mixedsort(unique(label_time))) ]
+    meta[, label_time_num := as.numeric(gsub("h", "", label_time))]
+    meta[, label_treat := "IAA"]
+    
+    meta[, genotype := str_extract(title, "WT|ELP|CTU2|FTSJ1")]
+    meta[, genotype := sedit(genotype, c("ELP", "CTU2", "FTSJ1"), c("ELP1 KO", "CTU2 KO", "FTSJ1 KO")  )]
+    meta[, genotype := factor(genotype, levels = c("WT", "ELP1 KO", "CTU2 KO", "FTSJ1 KO"))]
+    
+    meta[, replicate := ifelse(grepl("IAA", title), "pilot", paste0("rep", str_extract(title, "[A-Z]$"))) ]
+    
+    meta
+    
+    ## grandslam data
+    slam <- 
+      read_grandslam_introns("../results/mcm5s2U_quantseq/gedi/homo_sapiens_GRCh38_v35/slam.tsv")
+      
+    ## calculate new and old from min2 (if there is no read with min2 transitions, we set new to 0)
+    slam[, new := ifelse(setkeyv(meta, "run")[run, label_time_num] == 0, 0,  ifelse(min2 > 0, RPM * (min2 / Readcount), NA)) ] 
+    slam[, old := RPM - new ]
+    
+    ## calculate NTRs
+    slam[, NTR_grandslam := MAP]
+    slam[, NTR_min2 := min2/Readcount]
+    slam[, NTR_conv := (Conversions / Coverage) / 0.15 ]
+    
+    ## calculate decay rate
+    slam[, decay_rate_ntr  := decay_from_NTR(label_time = setkeyv(meta, "run")[run, label_time_num], NTR = NTR_grandslam)  ]
+    slam[, decay_rate_min2 := decay_from_NTR(label_time = setkeyv(meta, "run")[run, label_time_num], NTR = NTR_min2)]
+    slam[, decay_rate_conv := decay_from_NTR(label_time = setkeyv(meta, "run")[run, label_time_num], NTR = NTR_conv)]
+    head(slam)
+    
+    ## define robustly expressed genes
+    expressed_in_all <-
+      slam[region == "exonic",
+              .(is_expressed = Readcount > 0 ),
+              by = c("gene_id", "run")][,
+                                        .(is_expressed_in_all = sum(is_expressed) == length(is_expressed)),
+                                        by = "gene_id"][(is_expressed_in_all),
+                                                        gene_id]
+    cat(paste("Of", length(unique(slam$gene_id)), "genes,", sum(unique(slam$gene_id) %in% expressed_in_all), "are expressed in all runs."))
+    
+
+    
+    ## define outlier runs
+    # outliers = meta[title == "WT_200IAA", run]
+    outliers = c("CTU2_2h_B")
+    # outliers = c("")
+    
+    tpm <-
+      dcast(slam[region == "exonic",], gene_id ~ run, value.var = "TPM")
+    
+    cts <-
+      dcast(slam[region == "exonic",], gene_id ~ run, value.var = "Readcount")
+
+    dtm0 <-
+      merge(slam, meta, "run")[, .(time = label_time_num, 
+               gene_id,
+               region,
+               genotype, 
+               replicate, 
+               expression = ifelse(label_time_num == 0, 1, 1 - NTR) )]
+  })
+
+```
+
+```{r}
+
+registerDoParallel(cores = 10)
+system.time( 
+mcm5s2U_SLAM <-
+  within(mcm5s2U_SLAM, {
+    decay_coef_file = file.path(tmpDir, paste0("decay_coef_", digest::digest(dtm0), ".tsv"))
+    if(file.exists(decay_coef_file)){
+      decay_coef <- 
+        fread(decay_coef_file)
+      } else {
+        decay_coef <-
+          foreach(data = c("dtm0"), .combine = rbind) %:% foreach(method = c("nls", "lm"), .combine = rbind) %dopar% {
+            get(data)[gene_id %in% exlenTabGene$gene_id,  fit_decay(.SD, method = method)$coef
+                      ,  by = c("gene_id", "region", "genotype", "replicate")][, data := data][, method := method]
+            }
+        fwrite(decay_coef, decay_coef_file)
+      }
+    
+  })
+)
+
+head(mcm5s2U_SLAM$decay_coef)
+
+```
+
+#### Lugowski DRUID
+
+Half-life data from: Lugowski, A., Nicholson, B., and Rissland, O.S. (2018). DRUID: a pipeline for transcriptome-wide measurements of mRNA stability. RNA 24, 623–632. We then back-calculate decay rates to be consistent with other datasets.
+
+```{r druid}
+
+dataURLs = c("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE99nnn/GSE99517/suppl/GSE99517%5FHEK%2E4SU%2EHL%2EDRUID%2Eone%2Ecsv%2Egz", 
+             "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE99nnn/GSE99517/suppl/GSE99517%5FHEK%2E4SU%2EHL%2EDRUID%2Etwo%2Ecsv%2Egz")
+dataFiles = file.path(tmpDir, basename(sapply(dataURLs, URLdecode )))
+
+foreach(dataURL = dataURLs, dataFile = dataFiles) %do% {
+  if(!file.exists(dataFile))download.file(dataURL, dataFile)
+}
+
+druid <-
+  foreach(dataFile = dataFiles, .combine = rbind) %do% {
+    fread(dataFile)[, replicate := sedit(str_extract(dataFile, "one|two"), c("one", "two"), c("rep1", "rep2") )]
+  }
+setnames(druid, "V1", "gene")
+
+druid <-
+  dcast(druid, gene ~ replicate, value.var = names(druid[, !c("gene", "replicate")]))
+
+## back-calculate decay rates
+decay_druid <-
+  druid[, lapply(.SD, function(x){log(2)/x} ), by = "gene"]
+setnames(decay_druid, c(names(decay_druid[, 1]), paste0("druid_", names(druid[, -1]))))
+
+head(decay_druid)
+
+```
+
+#### Bazzini lab
+
+1.  Wu, Q., Medina, S.G., Kushawah, G., DeVore, M.L., Castellano, L.A., Hand, J.M., Wright, M., and Bazzini, A.A. (2019). Translation affects mRNA stability in a codon-dependent manner in human cells. eLife 8, e45396. https://doi.org/10.7554/eLife.45396.
+
+```{r wu_2019}
+require(org.Hs.eg.db)
+
+
+wu_2019 <-
+  within(list(), {
+    dataURL = "https://elifesciences.org/download/aHR0cHM6Ly9jZG4uZWxpZmVzY2llbmNlcy5vcmcvYXJ0aWNsZXMvNDUzOTYvZWxpZmUtNDUzOTYtZmlnMS1kYXRhMS12Mi54bHN4/elife-45396-fig1-data1-v2.xlsx?_hash=nQA8gIYVIymZnU1QP4ErD2TtiD9Qtm%2B5sBoO2wJmujs%3D"
+    dataFile = file.path(tmpDir, basename(dataURL))
+if(!file.exists(dataFile))download.file(url = dataURL, destfile = dataFile)
+    
+    data <-
+  rbindlist(foreach(i = 1:6) %do% {as.data.table(read_xlsx(dataFile, sheet = i))}, fill = TRUE)
+setnames(data, "Name", "ensembl_gene_id")
+
+## remove ORFome data
+data = data[datatype != "orf-ome"]
+## some datasets have the sign included; for these datasets, we need to flip the sign
+data[term == "time", decay_rate := - decay_rate]
+    
+  })
+
+
+head(wu_2019$data)
+
+
+## read data
+
+
+```
+
+#### Emetine SLAM-Seq
+
+1.  Rosa-Mercado, N.A., Buskirk, A.R., and Green, R. (2024). Translation elongation inhibitors stabilize select short-lived transcripts. RNA, rna.080138.124. https://doi.org/10.1261/rna.080138.124.
+
+```{r}
+require(bakR)
+
+emetine <-
+  within(list(), {
+    
+    ## low dose data
+    dataURL = "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE264661&format=file&file=GSE264661%5FLD%5Flog2fc%5FJuly2023%2Ecsv%2Egz"
+    dataFile = file.path(tmpDir, basename(URLdecode(dataURL)) )
+    # file.remove(dataFile)
+    if(!file.exists(dataFile)){download.file(dataURL, dataFile)}
+    
+    # ld <-
+    #   setnames(fread(dataFile), "V1", "gene")
+    
+    ## high dose data
+    dataURL = "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE264661&format=file&file=GSE264661%5FHD%5Flog2fc%5FJuly2023%2Ecsv%2Egz"
+    dataFile = file.path(tmpDir, basename(URLdecode(dataURL)) )
+    # file.remove(dataFile)
+    if(!file.exists(dataFile)){download.file(dataURL, dataFile)}
+    
+    # hd <-
+    #   setnames(fread(dataFile), "V1", "gene")
+    
+    
+    
+    decayFile = file.path(tmpDir, "emetine_Fit.rds" )
+    
+    if(!file.exists(decayFile)){
+      
+      ## cB
+      dataURL = "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE264661&format=file&file=GSE264661%5FcB%2Ecsv%2Egz"
+      
+      dataFile = file.path(tmpDir, basename(URLdecode(dataURL)) )
+      # file.remove(dataFile)
+      if(!file.exists(dataFile)){download.file(dataURL, dataFile, method = "wget")}
+      cB <-
+        fread(dataFile)
+      
+      metadf <-
+        data.frame(row.names = unique(cB$sample),
+                   tl = ifelse(grepl("ctl", unique(cB$sample)), 0, as.numeric(str_extract(unique(cB$sample), "[0-9]$"))),
+                   Exp_ID = ifelse(grepl("UT", unique(cB$sample)), 1, 2) )
+      
+      bakRData <-
+        bakRData(cB, metadf)
+
+      Fit <-
+        bakRFit(bakRData)
+
+      saveRDS(object = Fit, file = decayFile)
+      cB = NULL
+      gc()
+    }else{
+      Fit <-
+        readRDS(decayFile)
+    }
+    
+  })
+
+head(emetine$Fit$Fast_Fit$Fn_Estimates)
+
+```
+
+#### mcm5s2U STM2457
+
+```{r mcm5s2U_STM}
+
+mcm5s2U_STM <-
+  readRDS("../results/snakemake_QuantSeq/mcm5s2U_actD_tpm_noryeast_new.RDS")
+
+mcm5s2U_STM <-
+  mcm5s2U_STM[ c("meta", "tpm", "outliers")]
+
+setnames(mcm5s2U_STM$tpm, "gene_id", "ensembl_gene_id")
+
+mcm5s2U_STM$outliers
+
+mcm5s2U_STM$meta
+
+head(mcm5s2U_STM$tpm)
+
+```
+
+```{r}
+
+mcm5s2U_STM$log2FC_STM <-
+  mcm5s2U_STM$tpm[
+    , melt(.SD, id.vars = "ensembl_gene_id", variable.name = "run")
+  ][
+    , merge(.SD, mcm5s2U_STM$meta[!run %in% mcm5s2U_STM$outliers], "run")
+  ][
+    , dcast(.SD, ensembl_gene_id + genotype + time ~ treatment, value.var = "value", fun.aggregate = mean)
+  ][
+    , log2FC := log2((STM+1)/(mock+1))
+  ][
+    is.finite(log2FC)
+  ][
+    
+  ]
+
+head(mcm5s2U_STM$log2FC_STM)
+
+```
+
+### Consolidate decay data
+
+Here we create a single table with decay rates. Note that if decay rates were calculated with different methods, we can choose which to use here.
+
+```{r ++ decayData}
+
+## a table of decay rates
+decayData <-
+  Reduce(
+    f = function(x, y) {
+      merge(x, y, "gene", all.x = TRUE)
+    },
+    init = exlenTabGene[, .(gene)],
+    x = list(
+      wu_2019$data[
+        , merge(.SD, exlenTabGene, "ensembl_gene_id")
+      ][
+        is.finite(decay_rate), dcast(.SD, gene ~ datatype + cell_type + term, value.var = "decay_rate", fun.aggregate = mean)
+      ]
+      ,
+     druid[, .(gene, std_rep1, std_rep2)]
+    ))
+
+decayData <-
+  decayData[apply(decayData[, -1], 1, function(x){!all(is.na(x))}), ]
+
+head(decayData)
+
+```
+
+```{r adjust decayData, fig.width = 15, fig.height = 15}
+
+decayDataCorrected <-
+  decayData[, c(.SD[, 1], lapply(.SD[, -1], shift_ntile_zero, ntile = 0.01)) ]
+
+```
+
+```{r}
+
+ggplot(decayData, aes(x = value, col = normalization)) +
+  stat_density(data = function(x)melt(x, id.vars = "gene")[, normalization := "original"], geom="line", linetype = 2) +
+  stat_density(data = function(x)melt(x[, c(.SD[, 1], lapply(.SD[, -1], shift_ntile_zero, ntile = 0.01)) ], id.vars = "gene")[, normalization := "ntile_zero"], geom="line", linetype = 2) +
+  #stat_density(data = function(x)melt(x[,  as.data.table(limma::normalizeQuantiles(as.matrix(.SD[, -1], rownames = .SD[[1]])), keep.rownames = names(.SD[1])) ], id.vars = "gene")[, normalization := "quantile"], geom="line", linetype = 2) +
+  coord_cartesian(xlim = c(-5, 10)) +
+  #xlim(-5,10) +
+  facet_wrap(~ variable, scales = "free_y") +
+  NULL
+
+ggplot(decayData, aes(x = value, col = variable)) +
+  stat_density(data = function(x)melt(copy(decayData), id.vars = "gene")[, normalization := "original"], geom="line", linetype = 2) +
+  stat_density(data = function(x)melt(copy(decayDataCorrected), id.vars = "gene")[, normalization := "ntile_zero"], geom="line", linetype = 2) +
+  coord_cartesian(xlim = c(-5, 10)) +
+  #xlim(-5,10) +
+  facet_wrap(~ normalization) +
+  NULL
+
+```
+
+```{r decaybins}
+
+decaybins <-
+  decayDataCorrected[
+    , .(gene, decay_rate = endogenous_293t_time)
+  ][
+    , t12 := t12_from_decay(decay_rate)
+  ][
+   ! ((t12 < 0) | (t12 > 48)) , t12_bin := cut2(t12, g = 17, digits = 2)
+  ][
+    
+  ]
+
+decaybins[
+  ,
+  ][
+    , ggplot(.SD, aes( x= t12, fill = t12_bin)) +
+      geom_histogram(bins = 100) +
+      scale_x_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      geom_vline(xintercept = 5.5, linetype = 2, col = "blue") +
+      scale_fill_manual("t12 bins", values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      NULL
+  ]
+
+```
+
+## --- reporter qPCR ---
+
+```{r}
+## download qPCR data from GEO
+```
+
+```{r qpcr_data_complete, fig.width = 24, fig.height = 4}
+
+qpcr_data_combined = fread("../data/reporter_qPCR_Ct_values.tsv", sep ="\t")
+
+qpcr_data_combined[
+  , experiment := as.character(experiment)
+][
+  , reporter := factor(reporter, levels = names(palval_reporter))
+][
+  , txn_inh := factor(txn_inh, levels = c("ActD", "TLD"))
+][
+  , m6A_inh := factor(m6A_inh, levels = c("mock", "STM")) 
+][
+  , transl_inh := factor(gsub("none", "mock", str_split_i(sample , "_", 5)), levels = c("mock", "EM", "CHX"))
+][
+  , genotype := factor(gsub("KO", " KO", toupper(str_split_i(sample , "_", 6))), levels = names(palval_genotype))
+]
+
+## for experiments where the same untreated sample is used as t0, we need to fill in this sample for the conditions with translation inhibitor
+qpcr_data_filled <- 
+  qpcr_data_combined[
+    , {
+      ## duplicate t0 values
+      orig_data <- copy(.SD)
+      
+      orig_data[, condition_wo_transl_inh := paste(experiment, genotype, reporter, txn_inh, m6A_inh, target, replicate)]
+      
+      missing_CHX_t0 <-
+        orig_data[transl_inh == "CHX", dcast(.SD,  condition_wo_transl_inh ~ time, value.var = "Ct")][is.na(`0h`) & (!is.na(`1h`)|!is.na(`2h`)|!is.na(`4h`)) , condition_wo_transl_inh]
+      
+      missing_EM_t0 <-
+        orig_data[transl_inh == "EM" , dcast(.SD,  condition_wo_transl_inh ~ time, value.var = "Ct")][is.na(`0h`) & (!is.na(`1h`)|!is.na(`2h`)|!is.na(`4h`)) , condition_wo_transl_inh]
+
+      orig_data[, is_filled := FALSE]
+
+      filled_data <-
+        rbindlist(
+          list(
+            orig_data,
+            orig_data[time == "0h" & transl_inh == "mock" & condition_wo_transl_inh %in% missing_CHX_t0, ][, transl_inh := "CHX"][, is_filled := TRUE],
+            orig_data[time == "0h" & transl_inh == "mock" & condition_wo_transl_inh %in% missing_EM_t0,  ][, transl_inh := "EM" ][, is_filled := TRUE]
+          )
+        )
+
+      filled_data
+      
+    }
+    #, by = .(experiment, genotype, reporter, txn_inh, m6A_inh, target, replicate)
+  ]
+
+qpcr_data_normalized_spikein <-
+  qpcr_data_filled[
+    , {
+      ## normalize each sample to the TDH1 / yeast spike-in to control for cellular RNA amount / cell viability.
+      norm_data <- .SD[target == "TDH1" , .(norm_factor = mean(expression)), by = .(sample, experiment, replicate)]
+      data = merge(.SD, norm_data, by = c("sample", "experiment", "replicate"))
+      data[, expression := expression / norm_factor]
+      data[, norm_factor := NULL]
+    }
+  ]
+
+qpcr_data_normalized_mCherry <- 
+  qpcr_data_normalized_spikein[
+    , {
+      ## normalize the mNeonGreen2 in each sample to mCherry to control for transfection efficiency
+      ## we need a helper object "has_plasmid" to prevent dropping out of samples w/o plasmid
+      data = copy(.SD)[, has_plasmid := reporter != "none"]
+      norm_data <- data[, .(norm_factor = mean(expression[grepl("mCherry|NeoR", target)])), by = .(sample, experiment, replicate, has_plasmid)]
+      norm_data[!(has_plasmid), norm_factor := 1]
+      data = merge(data, norm_data, by = c("sample", "experiment", "replicate", "has_plasmid"))
+      data[grepl("mCherry|NeoR|Neon2", target), expression := expression / norm_factor] ## we only normalize the reporter mRNAs to mCherry
+      data[, norm_factor := NULL]
+      data[, has_plasmid := NULL]
+    }
+  ]
+
+qpcr_data_normalized_t0 <-
+    qpcr_data_normalized_mCherry[
+      , {
+        ## finally, we normalize each time series to t0. This is optional and should not change the half-lives.
+        norm_data <- .SD[time == "0h" , .(norm_factor = mean(expression)), by = .(target, reporter, txn_inh, m6A_inh, transl_inh, genotype, experiment)]
+        data = merge(.SD, norm_data, by = c("target", "reporter", "txn_inh", "m6A_inh", "transl_inh", "genotype", "experiment"))
+        data[, expression := expression / norm_factor]
+        data[, norm_factor := NULL][]
+        data
+      }
+    ]
+
+qpcr_data_complete <-
+  qpcr_data_normalized_t0[
+    , {
+      ## filter for complete timecourse
+      data = .SD
+      condition_table = data[, .(has_all_timepoints = all((c("0h") %in% as.character(time) & any(c("1h", "2h", "4h") %in% as.character(time)) )  ),
+                                 timepoints_missing = paste(setdiff(c("0h", "1h", "2h", "4h"), unique(as.character(time))), collapse = " ") )
+                             , by = .(experiment, genotype, reporter, txn_inh, transl_inh, m6A_inh, target)
+      ]
+      condition_table = unique(condition_table)
+      data[paste(experiment, genotype, reporter, txn_inh, transl_inh, m6A_inh, target) %in%
+             condition_table[(has_all_timepoints), paste(experiment, genotype, reporter, txn_inh, transl_inh, m6A_inh, target)] ]
+    }
+  ]
+
+head(qpcr_data_complete)
+
+```
+
+```{r  fig.width = 24, fig.height = 4}
+
+qpcr_data_filled[
+  ! target %in% c("TDH1", "mCherry")
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    geom_quasirandom(aes(shape= paste(experiment, replicate), col = is_filled), width = 0.2) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE, col = "black", linewidth = 0.5) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), aes(label = paste0(round(after_stat(log(2)/k_estimate), digits = 1), "h") )) +
+    scale_shape_manual(values= c(1:3,5:22)) +
+    facet_nested(target ~ genotype + reporter + txn_inh + transl_inh + m6A_inh, labeller = labeller(reporter = labeller_reporter_codons), scales = "free_y")  +
+    theme_bw() +
+    labs(title = paste(unique(.SD$experiment), collapse = " + ") ) +
+    NULL
+]
+
+```
+
+```{r  fig.width = 24, fig.height = 4}
+
+qpcr_data_complete[
+  ! target %in% c("TDH1", "mCherry")
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    geom_quasirandom(aes(shape= paste(experiment, replicate), col = experiment), width = 0.2) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE, col = "black", linewidth = 0.5) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), aes(label = paste0(round(after_stat(log(2)/k_estimate), digits = 1), "h") )) +
+    scale_shape_manual(values= c(1:3,5:22)) +
+    facet_nested(target ~ genotype + reporter + txn_inh + transl_inh + m6A_inh, labeller = labeller(reporter = labeller_reporter_codons), scales = "free_y")  +
+    theme_bw() +
+    labs(title = paste(unique(.SD$experiment), collapse = " + ") ) +
+    NULL
+]
+
+```
+
+## --- Ribosome profiling ---
+
+#### mcm5s2U riboseq
+
+This are the ribosome profiling datasets. Coverage files need to be genereated by running the separate snakemake workflow "snakemake_ribo_di_seq" or downloaded from GEO.
+
+```{r mcm5s2U_riboseq}
+
+# mcm5s2U_riboseq experiment 1
+## read in data
+mcm5s2U_riboseq_1 <-
+  get_tx_coverage(experiment_name = "exp1",
+                  file_path = "../results/snakemake_ribo_di_seq/monosome/",
+                  file_suffix = "_clipped_tr_nohrRNA_un_codon_Asite_offset_RPM_coverage.txt",
+                  combine = "union")
+## normalize in place
+with(mcm5s2U_riboseq_1, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
+
+## metadata
+mcm5s2U_riboseq_1$meta[, title := run]
+mcm5s2U_riboseq_1$meta[, genotype  := factor(sedit(str_extract(title, "WT|ELP1|CTU2"), from = c("CTU2", "ELP1"), to = c("CTU2 KO", "ELP1 KO")), levels = c("WT", "ELP1 KO", "CTU2 KO")) ]
+mcm5s2U_riboseq_1$meta[, treatment := factor("CTRL", levels = c("CTRL", "STM")) ]
+mcm5s2U_riboseq_1$meta[, replicate := str_extract(title, "[0-9]$") ]
+
+
+# mcm5s2U_riboseq experiment 2 (STM treatment)
+## read in data
+mcm5s2U_riboseq_2 <-
+  get_tx_coverage(experiment_name = "exp2",
+                  file_path = "../results/snakemake_ribo_di_seq/STM_monosome/",
+                  file_suffix = "_Mono_clpd_tr_no_r_t_sno_sn_RNA_codon_Asite_offset_RPM_coverage.txt",
+                  combine = "union")
+## normalize in place
+with(mcm5s2U_riboseq_2, coverage[,meta$run := lapply(.SD, function(x){x/(sum(x[is.finite(x)])/cds_len_cods) }), .SDcols = meta$run, by = .(ensembl_transcript_id, cds_len_cods)])
+
+## metadata
+mcm5s2U_riboseq_2$meta[, title := run]
+mcm5s2U_riboseq_2$meta[, genotype  := factor(sedit(str_extract(title, "WT|ELP1|CTU2"), from = c("CTU2", "ELP1"), to = c("CTU2 KO", "ELP1 KO")), levels = c("WT", "ELP1 KO", "CTU2 KO")) ]
+mcm5s2U_riboseq_2$meta[, treatment := factor(str_extract(title, "CTRL|STM"), levels = c("CTRL", "STM")) ]
+mcm5s2U_riboseq_2$meta[, replicate := str_extract(title, "[0-9]$") ]
+
+
+#
+# combine experiments
+#
+
+mcm5s2U_riboseq <-
+  list(
+    coverage = merge(mcm5s2U_riboseq_1$coverage, mcm5s2U_riboseq_2$coverage, c("ensembl_transcript_id", "cds_len_cods", "codon_rank"), all = TRUE),
+    meta = rbind(mcm5s2U_riboseq_1$meta, mcm5s2U_riboseq_2$meta)
+  )
+
+setkeyv(mcm5s2U_riboseq$meta, "run")
+
+rm("mcm5s2U_riboseq_1", "mcm5s2U_riboseq_2")
+gc()
+
+head(mcm5s2U_riboseq$coverage)
+
+mcm5s2U_riboseq$meta
+
+```
+
+```{r lift mcm5s2U coverage to codons}
+
+mcols(cods.gr) = mcols(cods.gr)[! names(mcols(cods.gr)) %in% mcm5s2U_riboseq$meta$run]
+gc()
+
+mcols(cods.gr) <-
+  cbind(mcols(cods.gr), as.data.table(cods.gr)[
+    , codonID := paste0(gsub("\\..*$", "", seqnames), "_",codon_rank)
+  ][][
+    , merge(.SD, mcm5s2U_riboseq$coverage[, codonID := paste0(ensembl_transcript_id, "_", codon_rank)][
+      , c("codonID", mcm5s2U_riboseq$meta$run)
+      , with = FALSE
+    ], "codonID", all.x = TRUE, sort = FALSE) 
+  ][
+    , mcm5s2U_riboseq$meta$run
+    , with = FALSE
+  ])
+
+## set NA coverage to 0
+for(run in mcm5s2U_riboseq$meta$run) {
+  mcols(cods.gr)[run][which(is.na(mcols(cods.gr)[run])),] = 0
+}
+
+cods.gr
+
+## remove coverage data to free up RAM
+mcm5s2U_riboseq$coverage = NULL
+gc()
+
+```
+
+#### Queuosine riboseq
+
+From: 1. Zhao, X., Ma, D., Ishiguro, K., Saito, H., Akichika, S., Matsuzawa, I., Mito, M., Irie, T., Ishibashi, K., Wakabayashi, K., et al. (2023). Glycosylated queuosines in tRNAs optimize translational rate and post-embryonic growth. Cell 186, 5517–5535. https://doi.org/10.1016/j.cell.2023.10.026.
+
+```{r queuosine_riboseq}
+
+## read in data
+queuosine_riboseq <-
+  get_tx_coverage(experiment_name = "zhao",
+                  file_path = "../results/snakemake_ribo_di_seq/queuosine/",
+                  file_suffix = "rep[0-9]+_coverage.txt",
+                  combine = "intersect")
+
+## metadata
+queuosine_riboseq$meta[, title := run]
+queuosine_riboseq$meta[, genotype  := factor(sedit(str_extract(title, "WT|QTRT1|QTRT2"), from = c("QTRT1", "QTRT2"), to = c("QTRT1 KO", "QTRT2 KO")), levels = c("WT", "QTRT1 KO", "QTRT2 KO")) ]
+queuosine_riboseq$meta[, replicate := str_extract(title, "[0-9]$") ]
+
+queuosine_riboseq
+
+```
+
+```{r lift queuosine coverage to codons}
+
+mcols(cods.gr) = mcols(cods.gr)[! names(mcols(cods.gr)) %in% queuosine_riboseq$meta$run]
+gc()
+
+mcols(cods.gr) <-
+  cbind(mcols(cods.gr), as.data.table(cods.gr)[
+    , codonID := paste0(gsub("\\..*$", "", seqnames), "_",codon_rank)
+  ][][
+    , merge(.SD, queuosine_riboseq$coverage[, codonID := paste0(ensembl_transcript_id, "_", codon_rank)][
+      , c("codonID", queuosine_riboseq$meta$run)
+      , with = FALSE
+    ], "codonID", all.x = TRUE, sort = FALSE) 
+  ][
+    , queuosine_riboseq$meta$run
+    , with = FALSE
+  ])
+
+## set NA coverage to 0
+for(run in queuosine_riboseq$meta$run) {
+  mcols(cods.gr)[run][which(is.na(mcols(cods.gr)[run])),] = 0
+}
+
+cods.gr
+
+## remove coverage data to free up RAM
+queuosine_riboseq$coverage = NULL
+gc()
+
+```
+
+# Paper figures
+
+## m6A position effect
+
+```{r m6A_region_miCLIP}
+
+m6A_region_miCLIP <-
+  setnames(as.data.table(drach.tx), "seqnames", "tx_name")[
+    , merge(.SD, txmodel[, .(tx_name, ensembl_gene_id)], "tx_name")
+  ][
+    ( is_m6A_miCLIP )
+  ][
+    , .(N_m6A = .N)
+    , by = .(ensembl_gene_id, region)
+  ][
+    , merge(exlenTabGene, .SD, all.x = TRUE) ## we need all.x = TRUE to include genes without m6A
+  ][
+    , .(gene, region, N_m6A)
+  ][
+    , region := factor(region, levels = c("utr5", "cds", "utr3"))
+  ][
+    , dcast(.SD, gene ~ region, value.var = "N_m6A", fun.aggregate = sum, fill = 0)
+  ][
+    !is.na(gene) , !"NA"
+  ][
+    , m6A_region := ifelse(utr5+cds+utr3 == 0,
+                           "none",
+                           paste0(
+                             ifelse(utr5 > 0, "utr5", ""),
+                             ifelse(cds  > 0, "cds",  ""),
+                             ifelse(utr3 > 0, "utr3", "")
+                           ))
+  ][
+    , m6A_region := factor(m6A_region, levels = c("none", "utr5", "utr5cds", "utr5cdsutr3", "cds", "cdsutr3", "utr3", "utr5utr3")) 
+  ][
+    
+  ]
+
+
+
+m6A_region_miCLIP[, .N, by = .(m6A_region)]
+
+head(m6A_region_miCLIP)
+
+```
+
+```{r m6A_region_GLORI}
+
+m6A_region_GLORI <-
+  setnames(as.data.table(drach.tx), "seqnames", "tx_name")[
+    , merge(.SD, txmodel[, .(tx_name, ensembl_gene_id)], "tx_name")
+  ][
+    , is_m6A_GLORI := glori_m6A_lvl > 0.1
+  ][
+    ( is_m6A_GLORI )
+  ][
+    , .(N_m6A = .N)
+    , by = .(ensembl_gene_id, region)
+  ][
+    , merge(exlenTabGene, .SD, all.x = TRUE) ## we need all.x = TRUE to include genes without m6A
+  ][
+    , .(gene, region, N_m6A)
+  ][
+    , region := factor(region, levels = c("utr5", "cds", "utr3"))
+  ][
+    , dcast(.SD, gene ~ region, value.var = "N_m6A", fun.aggregate = sum, fill = 0)
+  ][
+    !is.na(gene) , !"NA"
+  ][
+    , m6A_region := ifelse(utr5+cds+utr3 == 0,
+                           "none",
+                           paste0(
+                             ifelse(utr5 > 0, "utr5", ""),
+                             ifelse(cds  > 0, "cds",  ""),
+                             ifelse(utr3 > 0, "utr3", "")
+                           ))
+  ][
+    , m6A_region := factor(m6A_region, levels = c("none", "utr5", "utr5cds", "utr5cdsutr3", "cds", "cdsutr3", "utr3", "utr5utr3")) 
+  ][
+    
+  ]
+
+m6A_region_GLORI[, .N, by = .(m6A_region)]
+
+head(m6A_region_GLORI)
+
+```
+
+```{r region_metagene_miCLIP, fig.width = 2, fig.height = 1}
+
+metagene <-
+  ggplot(as.data.table(drach.tx)[
+    ( is_m6A_miCLIP )
+  ]
+  , aes(
+    x = relpos.cds
+    , fill = region
+  )) +
+  geom_histogram(bins = 200) +
+  geom_vline(xintercept = c(1,2)
+             , col ="blue"
+             , linetype=2) +
+  scale_fill_manual(values = palval_m6A_region
+                    , labels = c("utr5" = "5'UTR", "cds" = "CDS", "utr3" = "3'UTR")) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(c(0, 0))) +
+  labs(y = expression("m"^6*"A sites [N]")
+       , fill = "Transcript region") +
+  theme_pubr(base_size = 8) +
+  #theme(legend.position=c(0.35, 0.8), legend.background = element_rect(fill = NA)) +
+  theme(legend.position="none") +
+  theme(axis.text.x = element_blank()
+        , axis.title.x = element_blank()
+        , axis.ticks.x = element_blank()
+  ) +
+  guides(fill=guide_legend(ncol=3)) +
+  theme(legend.position = "none"
+        , panel.grid = element_blank()
+        , #axis.line = element_blank()
+        , axis.title.x = element_blank()
+        , axis.text = element_blank()
+        , axis.ticks = element_blank()
+        , panel.background = element_blank()
+  )
+
+gridmin = layer_scales(metagene)$y$range$range[1]
+gridmax = layer_scales(metagene)$y$range$range[2]
+gridrng = gridmax - gridmin
+gridmid = gridrng/ 2
+sizefct = 2 ## adjust y size (higher gives thicker UTRs)
+
+txlegend <-
+  ggplot() +
+  geom_blank() +
+  geom_rect(aes(xmin = -Inf, xmax = 1,    ymin = gridmin+gridrng/(2*sizefct) , ymax = gridmax-gridrng/(2*sizefct) ), fill = palval_m6A_region["utr5"]) +
+  geom_rect(aes(xmin = 1,    xmax = 2,    ymin = gridmin, ymax = gridmax ), fill = palval_m6A_region["cds"]) +
+  geom_rect(aes(xmin = 2,    xmax = Inf,  ymin = gridmin+gridrng/(2*sizefct) , ymax = gridmax-gridrng/(2*sizefct) ), fill = palval_m6A_region["utr3"]) +
+  geom_vline(xintercept = c(1,2), col ="blue", linetype=2) +
+  scale_x_continuous(expand = expansion(mult = 0), limits = layer_scales(metagene)$x$range$range) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = layer_scales(metagene)$y$range$range) +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank()) +
+  NULL
+
+p <-
+  ggarrange(
+    metagene + theme(plot.margin=unit(c(0,0,0,2), "mm"))
+    , txlegend + theme(plot.margin=unit(c(0,0,0,2), "mm"))
+    , ncol = 1
+    , heights = c(10, 1)
+    , align = "v")
+
+p
+
+ggsave(file.path(figDir, "region_metagene_miCLIP.pdf"), width = 2, height = 1)
+
+```
+
+```{r region_decay_boxplot_miCLIP, fig.width = 2, fig.height = 3}
+
+m6A_region_miCLIP[
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  gene %in% canonical_transcripts$gene
+][
+  , {
+    xlabs = c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    #labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = endogenous_293t_time
+           )) +
+      #geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+            stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.2 + c(0:3)*0.006,
+                         , tip.length = 0) +
+            scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      #theme(axis.text.x = element_text(size = 5)) +
+      coord_cartesian(ylim = c(0, 0.3)) +
+      NULL
+  }
+]
+
+ggsave(file.path(figDir, "region_decay_boxplot_miCLIP.pdf"), width = 1.5, height = 4)
+
+```
+
+```{r}
+
+m6A_region_miCLIP[
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  gene %in% canonical_transcripts$gene
+][
+  m6A_region %in% names(c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR"))
+][
+  , .N, by = "m6A_region"
+]
+
+```
+
+```{r region_decay_boxplot_GLORI, fig.width = 2, fig.height = 3}
+
+m6A_region_GLORI[
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  gene %in% canonical_transcripts$gene
+][
+  endogenous_293t_time < 3
+][
+  , {
+    xlabs = c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR")
+    breaks = c("none", "cds", "utr3", "cdsutr3")
+    labels = xlabs[breaks]
+    #labels = setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = endogenous_293t_time
+           )) +
+      geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5 
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+            stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      stat_compare_means(comparisons = list(c("none", "cds"), c("utr3", "cds"), c("utr3", "cdsutr3"))
+                         , label = "p.signif"
+                         , label.y =  0.2 + c(0:3)*0.006
+                         , tip.length = 0) +
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(breaks = breaks, labels = labels) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +#
+      theme_bw() +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      #theme(axis.text.x = element_text(size = 5)) +
+      coord_cartesian(ylim = c(0, 0.3)) +
+      NULL
+  }
+]
+
+ggsave(file.path(figDir, "region_decay_boxplot_GLORI.pdf"), width = 1.5, height = 4)
+
+```
+
+```{r}
+
+m6A_region_GLORI[
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  gene %in% canonical_transcripts$gene
+][
+  m6A_region %in% names(c("none" = expression("no"~m^6*"A"),  "cds" = "CDS", "utr3" = "3'UTR", "cdsutr3" = "CDS + 3'UTR"))
+][
+  , .N, by = "m6A_region"
+]
+
+```
+
+```{r}
+
+m6A_region_miCLIP[
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  gene %in% mcm5s2U_SLAM$tpm[, .(expression = mean(WT_0h_A, WT_0h_B)) , by = .(gene_id) ][expression > 0.1, mapIds(x = org.Hs.eg.db, keys = gsub("\\..*$", "", gene_id), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")]
+][
+  endogenous_293t_time < 0.8
+][
+  , {
+    xlabs = c("none" = "no\nm6A",  "utr5" = "5'UTR")
+    
+    region_labeller <-
+      function(breaks){
+        #setkeyv(.SD[, .N, by = "m6A_region"], "m6A_region")[breaks, paste0(xlabs[breaks], "\n(N=", N, ")") ]
+        xlabs[breaks]
+      }
+    
+    ggplot(.SD[m6A_region %in% names(xlabs)],
+           aes(x = factor(m6A_region, levels = names(xlabs)),
+               y = endogenous_293t_time
+           )) +
+      geom_blank() +
+      geom_boxplot_pattern(aes(fill = m6A_region, pattern_fill = m6A_region )
+                           , notch = T, outlier.size = 0.5
+                           , fatten = 1 ## controls median line segment
+                           , pattern_colour = NA
+                           , pattern_density = 0.5 
+                           , outlier.color = "grey50"
+                           , outlier.alpha = 0.3
+                           ) +
+      stat_compare_means(comparisons = list(c("none", "utr5"))
+                         , label = "p.signif"
+                         , label.y = 0.3 + c(0.03*0:2)
+                         , tip.length = 0) + 
+      scale_fill_manual(values = palval_m6A_region_fill ) +
+      scale_pattern_fill_manual(values = palval_m6A_region_fill_pattern) +
+      scale_x_discrete(labels = region_labeller) +
+      scale_y_continuous(name =  expression("Decay rate [h"^-1*"]") ) +
+      theme_pubr(base_size = 8) +
+      theme(legend.position = "none") +
+      theme(axis.title.x = element_blank()) +
+      #theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+      #theme(axis.text.x = element_text(size = 8)) +
+      coord_cartesian(ylim = c(-0.2, 0.5)) +
+      NULL
+  }
+]
+
+ggsave(file.path(figDir, "region_decay_boxplot_miCLIP_utr5.pdf"), width = 1.5, height = 3)
+
+```
+
+```{r glori_decay_metagene, fig.width = 8, fig.height = 4}
+
+p.glorimeta <-
+  as.data.table(drach.tx)[
+    , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+  ][
+    ! ( (region == "utr5" & relpos.cds >= 1) | (region == "utr3" & relpos.cds <= 2) ) , ## exclude codon / nucleotide region discrepancies
+  ][
+    , merge(.SD, canonical_transcripts, "ensembl_transcript_id")
+  ][
+   # , merge(.SD, exlenTabGene, "ensembl_gene_id")
+  ][
+    , merge(.SD, decayDataCorrected, "gene")
+  ][
+    , relposbin := cut2(relpos.cds, cuts = seq(0, 3, 0.01))
+  ][
+    , decayrate := endogenous_293t_time
+  ][
+    , merge(.SD, decaybins, "gene", all.x = TRUE)
+  ][
+    ! is.na(t12_bin)
+  ][
+    , c("t12_bin_mean", "t12_bin_N_genes" ) := .(mean(t12), length(unique(ensembl_gene_id)))
+    , by = .(t12_bin)
+  ][
+    , .(glori_m6A_sum = sum(glori_m6A_lvl), glori_m6A_mean = mean(glori_m6A_lvl)  )
+    , by = .(relposbin, region, t12_bin, t12_bin_mean, t12_bin_N_genes)
+  ][
+    , t12_label := as.character(round(t12_bin_mean, 1))
+  ][
+    , t12_label := factor(t12_label, levels = gtools::mixedsort(unique(t12_label))  )
+  ][
+    ,
+    ggplot(.SD,
+           aes( x = as.integer(relposbin), y = glori_m6A_sum )) +
+      geom_vline(data = function(x)x[region == "cds"], aes(xintercept = min(as.integer(relposbin))), linetype = 2, col = "blue" ) +
+      geom_vline(data = function(x)x[region == "cds"], aes(xintercept = max(as.integer(relposbin))), linetype = 2, col = "blue" ) +
+      ## points with continuous color scale
+      geom_point(aes(col = t12_bin_mean), shape = 16, alpha = 0.5) +
+      scale_color_gradientn(name = "Half-life [h]", colours = (brewer.pal(n = 7, name = "RdYlBu")), guide = "colorbar" ) +
+      #guides(color = guide_legend(title.position = "top")) +
+      ## smoothing splines with discrete color scale
+      new_scale_color() +
+      geom_smooth(aes(col = t12_label), method = "lm", formula = y ~ splines::bs(x, df = 40), se = F, show.legend = FALSE) +
+      scale_color_manual("t12 bins", values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      guides(color = guide_legend()) +
+      ## style
+      scale_x_continuous(expand = c(0, 0)) +
+      scale_y_continuous(name = expression("GLORI m"^6*"A level"), expand = c(0, NA)) +
+      theme_pubr(base_size = 8) +
+      theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+      theme(legend.position  = c(0.3, 0.7), legend.direction = "horizontal", legend.background = element_blank(), legend.title = element_blank() ) +
+      NULL
+  ]
+
+p.glorimeta
+
+ggsave(file.path(figDir, "glori_decay_metagene.pdf"), width = 4, height = 2)
+
+```
+
+```{r decaybins_expression}
+
+decaybins[
+  , merge(.SD, exlenTabGene)
+][
+  , merge(.SD, mcm5s2U_STM$tpm, "ensembl_gene_id")
+][
+  , merge(.SD, glori$dt[Gene != "ELSE", .(m6A_lvl = sum(m6A_lvl)), by = .(gene = Gene) ], "gene")
+][
+  !is.na(t12_bin)
+][
+  , 
+  
+  ggarrange(
+    ggplot(.SD, aes(x = t12_bin, y = m6A_lvl, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 20)) +
+      labs(x="", y = expression(m^6*A~level), fill = "Half-life bin") +
+      NULL
+    ,
+    ggplot(.SD, aes(x = t12_bin, y = WT_Ctrl_0h_rep1, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 200)) +
+      labs(x="Half-life bin [h]", y = "Expression level") +
+      NULL
+    , 
+    ncol = 1, align = "v", common.legend = TRUE, legend = "right"
+  )
+  
+]
+
+ggsave(file.path(figDir, "decaybins_expression.pdf"), width = 4.5, height = 4.5)
+
+```
+
+```{r , fig.height = 8, fig.width = 4}
+
+decaybins[
+  , merge(.SD, exlenTabGene)
+][
+  , merge(.SD, mcm5s2U_STM$tpm, "ensembl_gene_id")
+][
+  , merge(.SD, glori$dt[Gene != "ELSE", .(m6A_sites = length(m6A_lvl), m6A_lvl = sum(m6A_lvl)), by = .(gene = Gene) ], "gene")
+][
+  !is.na(t12_bin)
+][
+  ,  {
+    p.legend.dummy <-
+      ggplot(.SD, aes(x = t12_bin, y = m6A_lvl, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 20)) +
+      labs(fill = "Half-life bin", x="Half-life bin [h]", y = expression("Sum"~m^6*A~"lvl")) +
+      theme(axis.title.x = element_blank()) +
+      NULL
+    
+    
+    ggarrange(
+    p.glorimeta + labs(y = expression("Sum"~m^6*A~"lvl"))
+    ,
+    ggplot(.SD, aes(x = t12_bin, y = m6A_lvl, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 20)) +
+      labs(fill = "Half-life bin", x="Half-life bin [h]", y = expression("Sum"~m^6*A~"lvl")) +
+      theme(axis.title.x = element_blank()) +
+      NULL
+    ,
+    ggplot(.SD, aes(x = t12_bin, y = m6A_sites, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 40)) +
+      labs(fill = "Half-life bin", x="Half-life bin [h]", y = expression("N"~m^6*A~"sites") ) +
+      theme(axis.title.x = element_blank()) +
+      NULL
+    ,
+    ggplot(.SD, aes(x = t12_bin, y = m6A_lvl/ m6A_sites, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 1)) +
+      scale_y_continuous(breaks = c(0, 0.5, 1)) +
+      labs(fill = "Half-life bin", x="Half-life bin [h]", y = expression("Site-avg."~m^6*A) ) +
+      theme(axis.title.x = element_blank()) +
+      NULL
+    ,
+    ggplot(.SD, aes(x = t12_bin, y = WT_Ctrl_0h_rep1, fill = t12_bin )) +
+      geom_boxplot() +
+      stat_summary(fun.data = mean_se, geom = "point", shape = 3) +
+      scale_fill_manual(values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+      #scale_y_continuous(trans = "log10", breaks = c(3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 3), limits = c(1, 96) )  +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      theme(axis.text.x = element_blank()) +
+      #theme(legend.position = "none" ) +
+      coord_cartesian(ylim = c(0, 250)) +
+      labs(fill = "Half-life bin", x = "Half-life bin [h]", y = expression(~"Expression level") ) +
+      NULL
+    , 
+    ncol = 1, align = "hv", common.legend = TRUE, legend = "right"  , legend.grob = get_legend(p.legend.dummy)
+  )
+    
+  }
+  
+  
+  
+ 
+]
+
+
+ 
+
+```
+
+```{r}
+
+as.data.table(drach.tx)[
+  , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+][
+  ! ( (region == "utr5" & relpos.cds >= 1) | (region == "utr3" & relpos.cds <= 2) ) , ## exclude codon / nucleotide region discrepancies
+][
+  , merge(.SD, canonical_transcripts, "ensembl_transcript_id")
+][
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  , relposbin := cut2(relpos.cds, cuts = seq(0, 3, 0.01))
+][
+  , decayrate := endogenous_293t_time
+][
+  , t12 := t12_from_decay(decayrate)
+][
+ #  t12 > 0 & t12 < 96
+][
+ # , merge(.SD, decaybins[, .(ensembl_gene_id, t12_bin)], "ensembl_gene_id", all.x = TRUE) ## all.x = TRUE
+][
+  , t12_bin := cut2(t12, g = 17)
+][
+  , c("t12_bin_mean", "t12_bin_N_genes" ) := .(mean(t12), length(unique(ensembl_gene_id)))
+  , by = .(t12_bin)
+][
+  , .(glori_m6A_sum = sum(glori_m6A_lvl)  )
+  , by = .(relposbin, region, t12_bin, t12_bin_mean, t12_bin_N_genes)
+][
+  , t12_label := as.character(round(t12_bin_mean, 1))
+][
+  # , t12_label := paste0(t12_label, "h; N=", t12_bin_N_genes ), by = .(t12_bin)
+][
+  , t12_label := factor(t12_label, levels = gtools::mixedsort(unique(t12_label))  )
+][
+  
+][
+  ,
+  ggplot(.SD,
+         aes( x = as.integer(relposbin), y = glori_m6A_sum )) +
+    geom_vline(data = function(x)x[region == "cds"], aes(xintercept = min(as.integer(relposbin))), linetype = 2, col = "blue" ) +
+    geom_vline(data = function(x)x[region == "cds"], aes(xintercept = max(as.integer(relposbin))), linetype = 2, col = "blue" ) +
+    ## points with continuous color scale
+    geom_point(aes(col = t12_bin_mean), shape = 16, alpha = 0.5) +
+    scale_color_gradientn(name = "Half-life [h]", colours = (brewer.pal(n = 7, name = "RdYlBu")), guide = "colorbar" ) +
+    #guides(color = guide_legend(title.position = "top")) +
+    ## smoothing splines with discrete color scale
+    new_scale_color() +
+    geom_smooth(aes(col = t12_label), method = "lm", formula = y ~ splines::bs(x, df = 40), se = F, show.legend = FALSE) +
+    scale_color_manual("t12 bins", values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+    guides(color = guide_legend()) +
+    ## style
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(name = "GLORI m6A level", expand = c(0, NA)) +
+    theme_pubr(base_size = 8) +
+    theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+    theme(legend.position  = c(0.3, 0.7), legend.direction = "horizontal", legend.background = element_blank(), legend.title = element_blank()) +
+    NULL
+]
+
+```
+
+```{r region_decay_scatterplot}
+
+as.data.table(drach.tx)[
+  , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+][
+ # ! ( (region == "utr5" & relpos.cds >= 1) | (region == "utr3" & relpos.cds <= 2) ) , ## exclude codon / nucleotide region discrepancies
+][
+  , merge(.SD, canonical_transcripts, "ensembl_transcript_id")
+][
+  , merge(.SD, exlenTabGene, "gene")
+][
+  , .(glori_m6A_lvl = sum(glori_m6A_lvl))
+  , by = .(gene, region)
+][
+  , merge(.SD, decayDataCorrected, "gene")
+][
+  , merge(.SD, decaybins, "gene")
+][
+  region != "utr5"
+][ 
+  , ggplot(.SD, aes( x= glori_m6A_lvl , y = endogenous_293t_time)) +
+    geom_point(alpha = 0.5, aes(col = t12_bin), shape = 16) +
+    geom_smooth(method = "lm") +
+    stat_cor() +
+    ylim(0, 0.3) +
+    scale_color_manual("t12 bins", values = colorRampPalette((brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$t12_bin))) ) +
+    scale_x_continuous(trans = "log10") +
+    annotation_logticks(sides = "b") +
+    theme_bw() +
+    theme(legend.position = "none") + 
+    facet_grid(region~., labeller = labeller(region = c("cds" = "CDS", "utr3" = "3'UTR"))) +
+    labs(x = expression("m"^6*"A level"), y = expression("Decay rate [h"^-1*"]")) +
+    NULL
+]
+
+ggsave(file.path(figDir, "region_decay_scatterplot_GLORI.pdf"), width = 3, height = 4.5)
+
+```
+
+```{r gloribin_t12_emetine_scatter}
+
+## adapted from bakR::plotMA()
+
+percent_change_threshold = 0.2
+
+p.scatter <-
+as.data.table(emetine$Fit$Fast_Fit$Effects_df)[
+  , Avg_reads_natural := rowMeans(emetine$Fit$Data_lists$Stan_data$Avg_Reads_natural)
+][
+  , setnames(.SD, "XF", "gene")
+][
+  , merge(.SD, gloribins, "gene")
+][
+  , ggplot(.SD, aes( x = glori_m6A_lvl, y = L2FC_kdeg )) +
+    geom_hline(yintercept = 0) +
+    geom_point(aes(color = gloribin), alpha = 0.3) +
+    
+    scale_x_continuous(trans = "log10") +
+    annotation_logticks(sides = "b")  +
+    geom_smooth(method = "lm") +
+    stat_cor(label.y = 1, label.x.npc = "right", hjust = 1) +
+    
+    geom_hline(yintercept = log(1-0.2, 2), linetype = 2) +
+    geom_text(y = log(1-0.2, 2), x = Inf, label = paste("Stabilized by less than 20%:", .SD[, sum(L2FC_kdeg >=log(1-0.2, 2))], "genes"), check_overlap = TRUE, hjust = 1, vjust = -0.3 ) +
+    geom_text(y = log(1-0.2, 2), x = Inf, label = paste("Stabilized by more than 20%:", .SD[, sum(L2FC_kdeg < log(1-0.2, 2))], "genes"), check_overlap = TRUE, hjust = 1, vjust =  1.3 ) +
+    
+    
+    
+    scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    coord_cartesian(ylim = c(-1.5, 1)) +
+    xlab(expression("m"^6*"A level")) + 
+    ylab(bquote(L2FC(k[deg]))) + 
+    ylab(expression("Log"[2]~"fold-change [decay rate]")) +
+    NULL
+]
+
+p.density <-
+as.data.table(emetine$Fit$Fast_Fit$Effects_df)[
+  , Avg_reads_natural := rowMeans(emetine$Fit$Data_lists$Stan_data$Avg_Reads_natural)
+][
+  , setnames(.SD, "XF", "gene")
+][
+  , merge(.SD, gloribins, "gene")
+][
+  , ggplot(.SD, aes( x = L2FC_kdeg )) +
+    geom_vline(xintercept = 0) +
+    geom_density(aes(color = gloribin), alpha = 0.3)+
+    
+    geom_vline(xintercept = log(1-0.2, 2), linetype = 2) +
+
+    #scale_x_continuous(trans = "log10") +
+    #annotation_logticks(sides = "b")  +
+    #geom_smooth(method = "lm") +
+    #stat_cor(label.y = 1, label.x.npc = "right", hjust = 1) +
+    scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    #coord_cartesian(ylim = c(-1.5, 1)) +
+    #xlab("m6A level") + 
+    #ylab(bquote(L2FC(k[deg]))) + 
+    coord_flip(xlim = c(-1.5, 1)) +
+    NULL
+]
+
+ggarrange(p.scatter, p.density + theme(axis.text.y = element_blank(), axis.title.y = element_blank()), nrow = 1, widths = c(4,1))
+
+ggsave(file.path(figDir, "region_emetine_scatterplot_GLORI.png"), width = 5, height = 4)
+
+```
+
+```{r gloribin_t12_emetine}
+
+plotdat <-
+  as.data.table(emetine$Fit$Fast_Fit$Fn_Estimates)[
+    , setnames(.SD, "XF", "gene")
+  ][
+    , merge(.SD, gloribins, "gene")
+  ][
+    , treatment := factor(sedit(str_extract(sample, "UT|LDE"), c("UT", "LDE"), c("mock", "emetine") ), levels = c("mock", "emetine") )
+  ][
+    , .(decay_rate = mean(kdeg))
+    , by = .(treatment, gloribin)
+  ][
+    , dcast(.SD, gloribin ~ treatment, value.var = "decay_rate")
+  ]
+
+pl.scatter <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  as.integer(gloribin), y = t12_from_decay(`mock`), col = (gloribin) )) +
+      ## correlation
+      #geom_smooth(method = "lm") +
+      #stat_cor(label.y = Inf, vjust = 1.3*2) +
+      ## scatter
+      geom_point(size = 0.75) +
+      #geom_point(aes(y=t12_from_decay(`mock`)), size = 2, col = palval_genotype[["mock"]]) +
+      #geom_point(aes(y=t12_from_decay(`emetine`)), size = 2, col = palval_genotype[["emetine"]]) +
+      
+      geom_segment(aes(xend = as.integer(gloribin), y = t12_from_decay(`mock`), yend = t12_from_decay(`emetine`)), arrow = arrow(length = unit(2, "mm")) ) +
+      
+      #stat_poly_line(aes(y= t12_from_decay(`mock`)), col = palval_genotype[["mock"]], se = FALSE, linetype = 2) +
+      #stat_poly_line(aes(y= t12_from_decay(`emetine`)), col = palval_genotype[["emetine"]], se = FALSE, linetype = 2) +
+      geom_label_npc(label = "Emetine", npcx = 0.95, npcy = 0.95) +
+      scale_y_continuous(trans = "log10", breaks = c(0.75, 1.5, 3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+      ## style
+     # coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = "Half-life [h]"
+      )
+    ]
+
+pl.bar <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  as.integer(gloribin), y = log2(t12_from_decay(`emetine`) / t12_from_decay(`mock`)) )) +
+      
+      ## bar
+      geom_point(aes(col = (gloribin) , fill = (gloribin))) +
+      
+      ## correlation
+      stat_poly_line() +
+      #stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "bottom", label.x = "right", parse = TRUE) +
+      
+      ## scatter
+      #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+      
+      
+      ## style
+      #coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      scale_fill_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = expression(Log[2]*FC)
+      )
+    ]
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            theme(aspect.ratio=1) +
+            NULL
+          , pl.bar
+          , ncol = 1, align = "v", heights = c(2,1)
+          )
+
+ggsave(file.path(figDir, "gloribin_t12_emetine.pdf"), width = 3, height = 4)
+
+```
+
+```{r hallmark_t12_emetine}
+
+plotdat <-
+  as.data.table(emetine$Fit$Fast_Fit$Fn_Estimates)[
+    , setnames(.SD, "XF", "gene")
+  ][
+    , treatment := factor(sedit(str_extract(sample, "UT|LDE"), c("UT", "LDE"), c("mock", "emetine") ), levels = c("mock", "emetine") )
+  ][ 
+    , merge(.SD
+            , exlenTabGene
+            , "gene")
+  ][
+    , merge(.SD
+            , msigDT[grepl("HALLMARK_", gs_name), .(gene, gs_name)]
+            , "gene"
+            , allow.cartesian = TRUE
+    )
+  ][
+    , .(decay_rate = mean(kdeg)
+        , exlen = mean(exlen)
+        
+    )
+    , by = .(gs_name, treatment)
+  ][
+    , exbin := cut2(exlen, g = exlenbins)
+  ][
+    , dcast(.SD, gs_name + exbin ~ treatment, value.var = "decay_rate")
+  ][
+         , merge(.SD
+                 , merge(
+                   glori$dt[, .(m6Alvl = sum(m6A_lvl)), by = .(gene = Gene)]
+                   , msigDT, "gene")[, .(m6Alvl = mean(m6Alvl, na.rm = TRUE)), by = .(gs_name)]
+                 
+                 , "gs_name"
+         )
+       ]
+
+
+pl.scatter <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  m6Alvl, y = t12_from_decay(`mock`), col = (exbin) )) +
+      ## correlation
+      #geom_smooth(method = "lm") +
+      #stat_cor(label.y = Inf, vjust = 1.3*2) +
+      ## scatter
+      geom_point(size = 0.75) +
+      #geom_point(aes(y=t12_from_decay(`mock`)), size = 2, col = palval_genotype[["mock"]]) +
+      #geom_point(aes(y=t12_from_decay(`emetine`)), size = 2, col = palval_genotype[["emetine"]]) +
+      
+      geom_segment(aes(xend = m6Alvl, y = t12_from_decay(`mock`), yend = t12_from_decay(`emetine`)), arrow = arrow(length = unit(2, "mm")) ) +
+      
+              geom_text_repel(data = function(x){x[gs_name %in% gs_select, ]},
+                        aes(
+                          label = gsub(
+                            "HALLMARK_",
+                            "",
+                            gs_name
+                          )
+                          , col = exbin)
+                        #,  position = position_nudge_center(y = -0.1, center_y = 18)
+                        #, min.segment.length = 0
+                        , size = 3
+        ) +
+      
+      #stat_poly_line(aes(y= t12_from_decay(`mock`)), col = palval_genotype[["mock"]], se = FALSE, linetype = 2) +
+      #stat_poly_line(aes(y= t12_from_decay(`emetine`)), col = palval_genotype[["emetine"]], se = FALSE, linetype = 2) +
+      geom_label_npc(label = "Emetine", npcx = 0.95, npcy = 0.95) +
+      scale_y_continuous(trans = "log10", breaks = c(0.75, 1.5, 3, 6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+      ## style
+     # coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = palval_exbin) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = "Half-life [h]"
+      )
+    ]
+
+pl.bar <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  m6Alvl, y = log2(t12_from_decay(`emetine`) / t12_from_decay(`mock`)) )) +
+      
+      ## bar
+      geom_point(aes(col = (exbin) , fill = (exbin))) +
+      
+      ## correlation
+      stat_poly_line() +
+      #stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "bottom", label.x = "right", parse = TRUE) +
+      
+      ## scatter
+      #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+      
+      
+      ## style
+      #coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = palval_exbin) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = expression(Log[2]*FC)
+      )
+    ]
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            theme(aspect.ratio=1) +
+            NULL
+          , pl.bar
+          , ncol = 1, align = "v", heights = c(2,1)
+          )
+
+ggsave(file.path(figDir, "hallmark_t12_emetine.pdf"), width = 3, height = 4)
+
+```
+
+## Ribosome occupancy
+
+### miCLIP bins
+
+```{r, fig.width = 3, fig.height = 3}
+
+as.data.table(cods.gr)[
+  ! is.na(matched_status) &
+  ! codon %in% stop_codons &
+    codon %in% drach_codons &
+   rep(T,.N)
+][
+  , is_expressed := sum(cvg, na.rm = TRUE) > 10
+  , by = .(seqnames)
+][
+  (is_expressed) 
+][
+  , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+][
+  , merge(.SD, canonical_transcripts )
+][
+  , melt(.SD, id.vars=c("matched_status", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(matched_status, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+ # , treatment := factor(treatment, levels = c("mock", "STM"), labels = c("mock", "STM2457"))
+][
+  experiment == "exp2" & genotype == "WT"  & occupancy > 0
+][
+  , ggplot(.SD, aes(x = matched_status, y = occupancy)) +
+    #geom_point(aes(col = matched_status, shape = replicate)) +
+   # geom_boxplot(aes(col = matched_status), notch = TRUE, fill = NA) +
+    stat_summary(fun.data=mean_se, aes(col = matched_status), geom  = "pointrange") +
+    scale_color_manual(values = palval_drach_status ) +
+    #scale_fill_manual(values = palval_drach_status ) +
+    scale_x_discrete(labels = c("no DRACH" = "no DRACH", "DRACH" = "DRACH", "m6A" = expression(m^6*A)) ) +
+    facet_nested(~ treatment,  labeller = labeller(treatment = c("CTRL" = "mock", "STM" = "STM2457")) ) +
+    #facet_nested(~ codon, scales ="free_y") +
+    
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1) ) +
+    #theme(axis.text.x = element_blank()) +
+    #theme(axis.title.x = element_blank()) +
+    labs(x = expression("Codon"~m^6*A~"status"), y="A-site occupancy", col = expression(m^6*A~"status") ) +
+    theme(legend.position =  "none") +
+    #coord_cartesian(ylim = c(NA, 50)) +
+    NULL
+]
+
+
+ggsave(file.path(figDir, "miCLIP_occupancy.pdf"), width = 3, height = 3)
+
+```
+
+miCLIP bins
+
+```{r, fig.width = 6, fig.height = 6}
+
+as.data.table(cods.gr)[
+  ! is.na(matched_status)
+][
+  , melt(.SD, id.vars=c("codon", "matched_status", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(codon, matched_status, run)
+][
+  ! codon %in% stop_codons &
+    codon %in% drach_codons &
+   rep(T,.N)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+  experiment == "exp1" & genotype == "WT" & treatment == "CTRL"
+][
+  , codon_strength := get_codon_strength(codon)
+][
+  , ggplot(.SD, aes(x = matched_status, y = occupancy)) +
+    #geom_point(aes(col = matched_status, shape = replicate)) +
+    stat_summary(fun.data=mean_se, aes(col = matched_status), size = 0.25) +
+    
+    scale_color_manual(values = palval_drach_status ) +
+    # facet_nested_wrap(~ codon, scales ="free_y", nrow = 1) +
+    facet_nested( ~ codon_strength + codon, scales ="free_y") +
+    
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1) ) +
+    theme(axis.text.x = element_blank()) +
+    labs(x = expression("Codon"~m^6*A~"status"), y="A-site occupancy", col = expression(m^6*A~"status") ) +
+    theme(legend.position =  "none") +
+    NULL
+]
+
+
+ggsave(file.path(figDir, "miCLIP_codons_occupancy.pdf"), width = 8, height = 3)
+
+```
+
+### GLORI bins
+
+```{r, fig.width = 3, fig.height = 3}
+
+as.data.table(cods.gr)[
+  ! is.na(matched_status)
+][
+ # codon %in% setdiff(drach_codons, stop_codons)
+][
+ # , is_expressed := sum(cvg, na.rm = TRUE) > 1
+ # , by = .(seqnames)
+][
+ # (is_expressed) 
+][
+ # , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+][
+ # , merge(.SD, canonical_transcripts )
+][
+  , melt(.SD, id.vars=c("gloribin", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(gloribin, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+ genotype == "WT" 
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = treatment)) +
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+    scale_color_manual(values = c("CTRL" = "grey40", "STM" = "orange") ) +
+    # facet_nested( ~ experiment ) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    scale_x_continuous(limits = c(0,1)) +
+    NULL
+]
+
+ggsave(file.path(figDir, "GLORI_occupancy_quant.pdf"), width = 3, height = 3)
+
+```
+
+```{r, fig.width = 9, fig.height = 3}
+
+as.data.table(cods.gr)[
+  codon %in% setdiff(drach_codons, stop_codons)
+][
+#   , is_expressed := sum(cvg, na.rm = TRUE) > 1
+#   , by = .(seqnames)
+# ][
+#   (is_expressed) 
+# ][
+#   , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+# ][
+#   , merge(.SD, canonical_transcripts )
+][
+  , melt(.SD, id.vars=c("codon_strength", "gloribin", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(codon_strength, gloribin, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+  genotype == "WT" 
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = treatment)) +
+    
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+     
+    scale_color_manual(values = c("CTRL" = "grey40", "STM" = "orange") ) +
+    
+    facet_nested(~codon_strength ) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    scale_x_continuous(limits = c(0,1)) +
+    NULL
+]
+
+ggsave(file.path(figDir, "GLORI_occupancy_quant_codon_strength.pdf"), width = 8, height = 3)
+
+```
+
+```{r, fig.width = 3, fig.height = 6}
+
+as.data.table(cods.gr)[
+  codon %in% setdiff(drach_codons, stop_codons) &
+    codon_strength == "intermediate"
+# ][
+#   , is_expressed := sum(cvg, na.rm = TRUE) > 1
+#   , by = .(seqnames)
+# ][
+#   (is_expressed) 
+# ][
+#   , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+# ][
+#   , merge(.SD, canonical_transcripts )
+][
+  , m6A_position := factor(ifelse(codon %in% c("AAA", "AGA", "GAA", "GGA"), "Wobble", "Pos. 1 or 2"), levels = c("Wobble", "Pos. 1 or 2") )
+][
+  , gloribin := relevel(factor(ifelse(glori_m6A_lvl == 0, "[0]", as.character(cut2(glori_m6A_lvl,cuts = seq(0,1,0.1)))  ) ), "[0]")
+][
+  , melt(.SD, id.vars=c("m6A_position", "gloribin", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(m6A_position, gloribin, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+  genotype == "WT"  
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = treatment)) +
+    
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+     
+    scale_color_manual(values = c("CTRL" = "grey40", "STM" = "orange") ) +
+    
+    facet_nested_wrap(~m6A_position, ncol = 1 ) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    scale_x_continuous(limits = c(0,1)) +
+    NULL
+]
+
+ggsave(file.path(figDir, "GLORI_occupancy_quant_codon_strength_wobble.pdf"), width = 3, height = 6)
+
+```
+
+```{r, fig.width = 6, fig.height = 9}
+
+as.data.table(cods.gr)[
+  codon %in% setdiff(drach_codons, stop_codons)
+# ][
+#   , is_expressed := sum(cvg, na.rm = TRUE) > 1
+#   , by = .(seqnames)
+# ][
+#   (is_expressed) 
+# ][
+#   , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+# ][
+#   , merge(.SD, canonical_transcripts )
+][
+  , melt(.SD, id.vars=c("codon", "codon_tRNA_mod", "gloribin", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(codon, codon_tRNA_mod, gloribin, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+  codon %in% c("AAA", "AGA", "GAA", "CAA")
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = genotype)) +
+    
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                     "m~`=`~", round(b_1, 2)
+                     #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+    scale_color_manual(values = palval_genotype ) +
+    
+    facet_nested(codon ~  treatment, scale = "free_y",  labeller = labeller(treatment = c("CTRL" = "mock", "STM" = "STM2457"))) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    scale_x_continuous(limits = c(0,1)) +
+    NULL
+]
+
+ggsave(file.path(figDir, "GLORI_occupancy_quant_codon_strength_mcm5s2U.pdf"), width = 4.5, height = 6)
+
+```
+
+```{r, fig.width = 4.5, fig.height = 3}
+
+as.data.table(cods.gr)[
+  codon %in% c("AGA", "GGA") 
+][
+#   , is_expressed := sum(cvg, na.rm = TRUE) > 1
+#   , by = .(seqnames)
+# ][
+#   (is_expressed) 
+# ][
+#   , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+# ][
+#   , merge(.SD, canonical_transcripts )
+][
+  , melt(.SD, id.vars=c("codon", "codon_tRNA_mod", "gloribin", "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(codon, codon_tRNA_mod, gloribin, run)
+][
+ , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+][
+   genotype == "WT"
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = codon)) +
+    
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ] ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                     "m~`=`~", round(b_1, 2),
+                     "*`,`~italic(R)^2<0.01")
+                     ,
+                     paste0(
+                     "m~`=`~", round(b_1, 2),
+                     "*`,`~italic(R)^2~`=`~", round(r.squared, 2)))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+    scale_color_manual(values = palval_reporter_codons ) +
+    
+    facet_nested( ~  treatment, scale = "free_y",  labeller = labeller(treatment = c("CTRL" = "mock", "STM" = "STM2457"))) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    scale_x_continuous(limits = c(0,1)) +
+    NULL
+]
+
+ggsave(file.path(figDir, "GLORI_occupancy_quant_codon_strength_mcm5s2U_GGA.pdf"), width = 4.5, height = 3)
+
+```
+
+### Codons general
+
+```{r codons_occupancy_KO, fig.width = 18, fig.height = 3}
+
+p <-
+  as.data.table(cods.gr)[
+   codon_tRNA_mod != "stop"
+  ][
+    , melt(.SD, id.vars= c( c("codon", "codon_tRNA_mod"), "glori_m6A_lvl"), measure.vars = mcm5s2U_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+  ][
+    , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+    , by = .(codon, codon_tRNA_mod, run)
+  ][
+    , c("experiment", "genotype", "treatment", "replicate")  := mcm5s2U_riboseq$meta[run, .(experiment, genotype, treatment, replicate) ]
+  ][
+    experiment == "exp1" & treatment == "CTRL"
+  ][
+    , ggplot(.SD, aes(x = codon, y = occupancy, col = genotype)) +
+      #geom_point(aes(col = gloribin, shape = replicate)) +
+      #stat_summary(fun.data = mean_se, size = 0.25, position = position_dodge(width = 0.5)) +
+      
+      scale_color_manual(values = palval_genotype) +
+      
+      #geom_text(y = Inf, aes(label = ifelse(N>1e4,"N>10k",paste0("N=",N)) ), angle = 90, hjust = 1, size = 2,check_overlap = TRUE) +
+      
+      
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Courier") ) +
+      #theme(axis.text.x = element_blank()) +
+      theme(legend.position =  "none") +
+      
+      labs(x = "Codon", y="A-site occupancy", col = "Genotype") +
+      
+      NULL
+  ]
+
+## scaled facets from: https://stackoverflow.com/a/61127086
+p + 
+  facet_nested(~ codon_tRNA_mod , scales ="free_x", space = "free") +
+  stat_summary(fun.data = mean_se, size = 0.25, position = position_dodge(width = 0.75)) + 
+   ggforce::facet_row( ~ codon_tRNA_mod  , scales = "free", space = "free") +
+   theme(panel.spacing.x = unit( 0 , units = "lines") ) +
+  NULL
+
+ggsave(file.path(figDir, "codons_occupancy_KO.pdf"), width = 9, height = 2)
+
+```
+
+## Reporter
+
+```{r DRACH_reporter_mock, fig.width = 2, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+        txn_inh == "ActD" & 
+    transl_inh == "mock" &
+    m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = reporter)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.11) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_reporter) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.2)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+  
+ggsave(file.path(figDir, "DRACH_reporter_mock.pdf"), width = 2, height = 2, units = "in")
+
+```
+
+```{r DRACH_reporter_mock_TLD, fig.width = 2, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+        txn_inh == "TLD" & 
+    transl_inh == "mock" &
+    m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = reporter)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.11) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_reporter) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.2)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+  
+ggsave(file.path(figDir, "DRACH_reporter_mock_TLD.pdf"), width = 2, height = 2, units = "in")
+
+```
+
+```{r DRACH_reporter_mock2, fig.width = 4, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+   #     txn_inh == "ActD" & 
+    transl_inh == "mock" &
+    m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = reporter)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.11) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_reporter) +
+    facet_nested( ~ txn_inh , scales = "free_y", labeller = labeller(txn_inh = c("ActD" = "Actinomycin D", "TLD"="Triptolide") ) )  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.3)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+  
+ggsave(file.path(figDir, "DRACH_reporter_mock2.pdf"), width = 2.5, height = 2, units = "in")
+
+```
+
+```{r DRACH_reporter_STM2, fig.width = 4, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+    txn_inh == "ActD" & 
+    transl_inh == "mock" &
+    #m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = m6A_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.12) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_m6A_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    #facet_nested(~reporter, strip = ) +
+    facet_nested(~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = label_parsed ) +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_STM2.pdf"), width = 4, height = 2, units = "in")
+
+```
+
+```{r DRACH_reporter_TLD, fig.width = 4, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+    txn_inh == "TLD" & 
+    transl_inh == "mock" &
+    #m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = m6A_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.12) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_m6A_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    #facet_nested(~reporter, strip = ) +
+    facet_nested(~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = label_parsed ) +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_TLD.pdf"), width = 4, height = 2, units = "in")
+
+```
+
+```{r , fig.width = 4, fig.height = 4}
+
+qpcr_data_complete[
+  genotype == "WT" &
+   # txn_inh == "TLD" & 
+    transl_inh == "mock" &
+    #m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = m6A_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.11) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_m6A_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.3)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    #facet_nested(~reporter, strip = ) +
+    facet_nested(txn_inh ~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = labeller(txn_inh = c("ActD" = "Actinomycin D", "TLD"="Triptolide"), reporter = label_parsed )  ) +
+    NULL
+]
+
+```
+
+```{r, fig.width = 4, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+    transl_inh == "mock" &
+    #m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C3", "C4") &
+    rep(TRUE, .N)
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = m6A_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.12) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_m6A_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    #facet_nested(~reporter, strip = ) +
+    facet_nested(~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = label_parsed ) +
+    NULL
+]
+
+```
+
+```{r DRACH_reporter_EM2, fig.width = 3, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+    txn_inh == "ActD" & 
+    transl_inh != "CHX" &
+    m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C1", "C2", "C4") & 
+    rep(TRUE, .N)
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = transl_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.1 ) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_transl_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    facet_nested(~reporter, strip = ) +
+    facet_nested(~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = label_parsed ) +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_EM2.pdf"), width = 3, height = 2.5, units = "in")
+
+```
+
+```{r DRACH_reporter_CHX2, fig.width = 3, fig.height = 2}
+
+qpcr_data_complete[
+  genotype == "WT" &
+    txn_inh == "ActD" & 
+    transl_inh != "EM" &
+    m6A_inh == "mock" &
+    target == "Neon2" &
+   reporter %in% c("C1", "C2", "C4") & 
+    rep(TRUE, .N)
+][
+  #, reporter := factor(reporter, levels = names(labeller_reporter))
+][
+  , reporter := factor(reporter, levels = names(labeller_reporter), labels = labeller_reporter)
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = transl_inh)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression)) ), label.x = "right",
+                  aes(label = paste0(signif(after_stat(log(2)/k_estimate), digits = 2), "h") ), vstep = 0.1 ) +
+    scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_transl_inh) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    #facet_nested(m6A_inh ~ transl_inh , scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    facet_nested(~reporter, strip = ) +
+    facet_nested(~ reporter,
+                 strip = strip_nested(background_x = elem_list_rect(fill= palval_reporter[c("C4", "C2", "C1")] ) , by_layer_x = FALSE),
+                 labeller = label_parsed ) +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_CHX2.pdf"), width = 3, height = 2.5, units = "in")
+
+```
+
+```{r DRACH_reporter_AGA, fig.width = 6, fig.height = 3}
+
+qpcr_data_complete[
+ # genotype == "WT" &
+  txn_inh == "ActD" & 
+    transl_inh == "mock" &
+    # m6A_inh == "mock" &
+    target == "Neon2" &
+    reporter %in% c("C2") &
+    #  ! grepl("ELP", genotype) &
+    rep(TRUE, .N)
+][
+  , m6A_inh := factor(m6A_inh, levels = c("mock", "STM"), labels = c("mock", "STM2457"))
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = genotype)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    geom_decay_line(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype")) +
+    geom_decay_text(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype"), vjust_var = "genotype") +
+    #stat_poly_line(formula = y ~ poly(x, 2, raw = TRUE) ) +
+    #scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_genotype) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    facet_nested(reporter ~ m6A_inh , labeller = labeller(reporter = labeller_reporter_codons)
+                 #, strip = strip_nested(background_x = elem_list_rect(fill= palval_m6A_inh[c("mock", "STM")] ))
+                 ,  scales = "free_y")  +
+    theme_bw() +
+    #coord_cartesian(ylim = c(0, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_AGA.pdf"), width = 4.5, height = 2.5)
+
+```
+
+```{r DRACH_reporter_GGA, fig.width = 4.5, fig.height = 4}
+
+qpcr_data_complete[
+ # genotype == "WT" &
+  txn_inh == "ActD" & 
+    transl_inh == "mock" &
+    # m6A_inh == "mock" &
+    target == "Neon2" &
+     reporter %in% c("C2" ,"C5") &
+    #  ! grepl("ELP", genotype) &
+    rep(TRUE, .N)
+][
+  , m6A_inh := factor(m6A_inh, levels = c("mock", "STM"), labels = c("mock", "STM2457"))
+][
+  genotype == "WT"
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = reporter)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    
+    
+   # geom_decay_line(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype")) +
+  #  geom_decay_text(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype"), vjust_var = "genotype") +
+    
+    geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+    stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression))  ), aes(label = paste0(round(after_stat(log(2)/k_estimate), digits = 1), "h") )) +
+
+    
+    #scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_reporter ) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    facet_nested( ~ m6A_inh , labeller = labeller(reporter = labeller_reporter_codons), scales = "free_y")  +
+    theme_bw() +
+    coord_cartesian(ylim = c(NA, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_GGA.pdf"), width = 4.5, height = 2.5)
+
+```
+
+```{r DRACH_reporter_GGA_mcm5s2U, fig.width = 4.5, fig.height = 4}
+
+qpcr_data_complete[
+ # genotype == "WT" &
+  txn_inh == "ActD" & 
+    transl_inh == "mock" &
+     m6A_inh == "mock" &
+    target == "Neon2" &
+     reporter %in% c("C2" ,"C5") &
+    #  ! grepl("ELP", genotype) &
+    rep(TRUE, .N)
+][
+ # genotype == "WT"
+][
+  , ggplot(.SD,
+           aes(x = time_num, y = expression, col = genotype)) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    #geom_quasirandom(aes(shape= paste(experiment, replicate)), width = 0.2) +
+    stat_summary(fun.data = mean_sd) +
+    
+    
+    geom_decay_line(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype")) +
+    geom_decay_text(by = c("target", "reporter", "transl_inh",  "m6A_inh", "genotype"), vjust_var = "genotype") +
+    
+  #  geom_smooth(method = "nls", formula = y ~ I(a*exp(-k*x)), method.args = list(  start = c(k = 0, a = max(expression)) ), se = FALSE) +
+   # stat_fit_tidy(method = "nls", method.args = list(formula = y ~ I(a*exp(-k*x)), start = c(k = 0, a = max(expression))  ), aes(label = paste0(round(after_stat(log(2)/k_estimate), digits = 1), "h") )) +
+
+    
+    #scale_shape_manual(values= c(1:3,5:20)) +
+    scale_color_manual(values = palval_genotype ) +
+    scale_y_continuous(breaks = c(0, 0.5, 1)) +
+    facet_nested( ~ reporter, labeller = labeller(reporter = labeller_reporter_codons), scales = "free_y")  +
+    theme_bw() +
+    #coord_cartesian(ylim = c(NA, 1.4)) +
+    theme(legend.position = "none") +
+    labs(x = "Time [h]", y = "Relative expression") +
+    NULL
+]
+
+ggsave(file.path(figDir, "DRACH_reporter_GGA_mcm5s2U.pdf"), width = 4.5, height = 2.5)
+
+```
+
+## endogenous mRNAs
+
+### GLORI bin
+
+```{r, fig.width = 3, fig.height = 3}
+
+mcm5s2U_SLAM$slam[
+  region == "exonic"
+][
+  , ensembl_gene_id := gsub("\\..*$","",gene_id)
+][
+  , merge(.SD, exlenTabGene, "ensembl_gene_id")
+][
+  , merge(.SD, gloribins, "gene")
+][
+  , .(Readcount = sum(Readcount) , min2 = sum(min2))
+  , by = .(gloribin, run)
+][
+  , NTR := min2 / Readcount
+][
+  , merge(.SD, mcm5s2U_SLAM$meta, "run")
+][
+  , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+][
+  , {
+    fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+    coeff = summary(fit)$coefficients
+    data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+  }
+  , by = .(gloribin, genotype )
+][
+  , dcast(.SD, gloribin ~ genotype, value.var = "decay_rate")
+][
+  , ggplot(.SD,
+           aes(x =  as.integer(gloribin), y = t12_from_decay(`WT`), col = (gloribin) )) +
+    ## correlation
+    #geom_smooth(method = "lm") +
+    #stat_cor(label.y = Inf, vjust = 1.3*2) +
+    ## scatter
+    geom_point(size = 0.75) +
+    #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+    #geom_point(aes(y=t12_from_decay(`CTU2 KO`)), size = 2, col = palval_genotype[["CTU2 KO"]]) +
+    
+    geom_segment(aes(xend = as.integer(gloribin), y = t12_from_decay(`WT`), yend = t12_from_decay(`CTU2 KO`)), arrow = arrow(length = unit(2, "mm")) ) +
+    geom_label_npc(label = "CTU2 KO", npcx = 0.95, npcy = 0.95) +
+    #stat_poly_line(aes(y= t12_from_decay(`WT`)), col = palval_genotype[["WT"]], se = FALSE, linetype = 2) +
+    #stat_poly_line(aes(y= t12_from_decay(`CTU2 KO`)), col = palval_genotype[["CTU2 KO"]], se = FALSE, linetype = 2) +
+    scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+    ## style
+    #coord_cartesian(ylim = c(6, 60)) +
+    scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    labs(x = expression(m^6*A~"level [A.U.]"),
+         y = "Half-life [h]"
+    ) 
+]
+
+```
+
+```{r gloribin_t12_CTU2, fig.width = 3, fig.height = 4}
+
+plotdat <-
+  mcm5s2U_SLAM$slam[
+    region == "exonic"
+  ][
+    , ensembl_gene_id := gsub("\\..*$","",gene_id)
+  ][
+    , merge(.SD, exlenTabGene, "ensembl_gene_id")
+  ][
+  , merge(.SD, gloribins, "gene")
+  ][
+    , .(Readcount = sum(Readcount)
+        , min2 = sum(min2)
+    )
+    , by = .(gloribin, run)
+  ][
+    , NTR := min2 / Readcount
+  ][
+    , merge(.SD, mcm5s2U_SLAM$meta, "run")
+  ][
+    , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+  ][
+    , {
+      fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+      coeff = summary(fit)$coefficients
+      data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+    }
+    , by = .(gloribin, genotype )
+  ][
+    , dcast(.SD, gloribin ~ genotype, value.var = "decay_rate")
+  ]
+
+pl.scatter <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  as.integer(gloribin), y = t12_from_decay(`WT`), col = (gloribin) )) +
+      ## correlation
+      #geom_smooth(method = "lm") +
+      #stat_cor(label.y = Inf, vjust = 1.3*2) +
+      ## scatter
+      geom_point(size = 0.75) +
+      #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+      #geom_point(aes(y=t12_from_decay(`CTU2 KO`)), size = 2, col = palval_genotype[["CTU2 KO"]]) +
+      
+      geom_segment(aes(xend = as.integer(gloribin), y = t12_from_decay(`WT`), yend = t12_from_decay(`CTU2 KO`)), arrow = arrow(length = unit(2, "mm")) ) +
+      
+      #stat_poly_line(aes(y= t12_from_decay(`WT`)), col = palval_genotype[["WT"]], se = FALSE, linetype = 2) +
+      #stat_poly_line(aes(y= t12_from_decay(`CTU2 KO`)), col = palval_genotype[["CTU2 KO"]], se = FALSE, linetype = 2) +
+      geom_label_npc(label = "CTU2 KO", npcx = 0.98, npcy = 0.98) +
+      scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+      ## style
+      coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = "Half-life [h]"
+      )
+    ]
+
+pl.bar <-
+  plotdat[
+    , 
+    ggplot(.SD,
+           aes(x =  as.integer(gloribin), y = log2(t12_from_decay(`CTU2 KO`) / t12_from_decay(`WT`)) )) +
+      
+      ## bar
+      geom_point(aes(col = (gloribin) , fill = (gloribin))) +
+      
+      ## correlation
+      stat_poly_line() +
+     # stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "top", label.x = "right", parse = TRUE) +
+      
+      ## scatter
+      #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+      
+      
+      ## style
+      #coord_cartesian(ylim = c(6, 60)) +
+      scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      scale_fill_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      labs(x = expression(m^6*A~"level [A.U.]"),
+           y = expression(Log[2]*FC)
+      )
+    ]
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            theme(aspect.ratio=1) +
+            NULL
+          , pl.bar
+          , ncol = 1, align = "v", heights = c(2,1)
+          )
+
+ggsave(file.path(figDir, "gloribin_t12_CTU2.pdf"), width = 3, height = 4)
+
+```
+
+```{r gloribin_t12_ELP1, fig.width = 3, fig.height = 4}
+
+
+plotdat <-
+mcm5s2U_SLAM$slam[
+  region == "exonic"
+][
+  , ensembl_gene_id := gsub("\\..*$","",gene_id)
+][
+  , merge(.SD, exlenTabGene, "ensembl_gene_id")
+][
+  , merge(.SD, gloribins, "gene")
+][
+  , .(Readcount = sum(Readcount)
+      , min2 = sum(min2)
+  )
+  , by = .(gloribin, run)
+][
+       , NTR := min2 / Readcount
+     ][
+       , merge(.SD, mcm5s2U_SLAM$meta, "run")
+     ][
+       , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+     ][
+       , {
+         fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+         coeff = summary(fit)$coefficients
+         data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+       }
+       , by = .(gloribin, genotype )
+     ][
+       , dcast(.SD, gloribin ~ genotype, value.var = "decay_rate")
+     ]
+
+
+
+pl.scatter <-
+plotdat[
+       , 
+       ggplot(.SD,
+                aes(x =  as.integer(gloribin), y = t12_from_decay(`WT`), col = (gloribin) )) +
+         ## correlation
+         #geom_smooth(method = "lm") +
+         #stat_cor(label.y = Inf, vjust = 1.3*2) +
+         ## scatter
+         geom_point(size = 0.75) +
+         #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+         #geom_point(aes(y=t12_from_decay(`ELP1 KO`)), size = 2, col = palval_genotype[["ELP1 KO"]]) +
+         
+         geom_segment(aes(xend = as.integer(gloribin), y = t12_from_decay(`WT`), yend = t12_from_decay(`ELP1 KO`)), arrow = arrow(length = unit(2, "mm")) ) +
+         
+         #stat_poly_line(aes(y= t12_from_decay(`WT`)), col = palval_genotype[["WT"]], se = FALSE, linetype = 2) +
+         #stat_poly_line(aes(y= t12_from_decay(`ELP1 KO`)), col = palval_genotype[["ELP1 KO"]], se = FALSE, linetype = 2) +
+         geom_label_npc(label = "ELP1 KO", npcx = 0.98, npcy = 0.98) +
+         scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+         ## style
+         coord_cartesian(ylim = c(6, 60)) +
+         scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+         theme_bw() +
+         theme(legend.position = "none") +
+         labs(x = expression(m^6*A~"level [A.U.]"),
+              y = "Half-life [h]"
+         )
+       
+       
+     ]
+
+pl.bar <-
+plotdat[
+       , 
+       ggplot(.SD,
+                aes(x =  as.integer(gloribin), y = log2(t12_from_decay(`ELP1 KO`) / t12_from_decay(`WT`)) )) +
+     
+          ## bar
+          geom_point(aes(col = (gloribin) , fill = (gloribin))) +
+         
+         ## correlation
+         stat_poly_line() +
+         # stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "top", label.x = "right", parse = TRUE) +
+         
+         ## scatter
+         #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+         
+         
+         ## style
+         #coord_cartesian(ylim = c(6, 60)) +
+         scale_color_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+         scale_fill_manual(values = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(unique(.SD$gloribin)))) +
+         theme_bw() +
+         theme(legend.position = "none") +
+         labs(x = expression(m^6*A~"level [A.U.]"),
+              y = expression(Log[2]*FC)
+         )
+       
+       
+     ]
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            #theme(aspect.ratio=1) +
+            NULL
+          , 
+          pl.bar
+          , 
+          ncol = 1, align = "v", heights = c(2,1)
+          )
+ggsave(file.path(figDir, "gloribin_t12_ELP1.pdf"), width = 3, height = 4)
+
+```
+
+### Cancer Hallmark
+
+```{r}
+## geneset categories
+gs_signaling = msigDT[grepl("HALLMARK|KEGG", gs_name) & grepl("SIGNALING|RESPONSE", gs_name) & !grepl("_UP$|_DN$|UNFOLDED", gs_name), unique(gs_name) ]
+gs_metabolic = msigDT[grepl("HALLMARK|KEGG", gs_name) & grepl("METABOLISM|GLYCOLYSIS|SECRETION|OXYGEN|OXIDATIVE|CHOLESTEROL", gs_name), unique(gs_name) ]
+
+gs_select = grep("TGF|TNF|NOTCH|MYC|OXIDATIVE|SECRETION|FATTY|INFLAMMATORY_RESPONSE|HEDGEHOG", c(gs_signaling, gs_metabolic), value = TRUE)
+
+```
+
+```{r hallmark_t12_m6A, fig.width = 3, fig.height = 3}
+
+  with(mcm5s2U_SLAM,
+       slam[
+         region == "exonic"
+       ][ 
+         , merge(.SD
+                 , exlenTabGene
+                 , "gene_id")
+       ][
+         , merge(.SD
+                 , msigDT[grepl("HALLMARK_", gs_name), .(gene, gs_name)]
+                 , "gene"
+                 , allow.cartesian = TRUE
+         )
+       ][
+         , .(Readcount = sum(Readcount)
+             , min2 = sum(min2)
+             , exlen = mean(exlen)
+         )
+         , by = .(run, region, gs_name)
+       ][
+         , NTR := min2/Readcount
+       ][
+         , merge(.SD, meta, "run")
+       ][
+         , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+       ][
+         , exbin := cut2(exlen, g = exlenbins)
+       ][
+         , {
+           fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+           coeff = summary(fit)$coefficients
+           data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+         }
+         , by = .(gs_name, region, exlen, exbin, genotype )
+       ][
+         , dcast(.SD, gs_name + region + exlen + exbin ~ genotype, value.var = "decay_rate")
+       ][
+         , merge(.SD
+                 , merge(
+                   glori$dt[, .(m6Alvl = sum(m6A_lvl)), by = .(gene = Gene)]
+                   , msigDT, "gene")[, .(m6Alvl = mean(m6Alvl, na.rm = TRUE)), by = .(gs_name)]
+                 
+                 , "gs_name"
+         )
+       ])[
+      ,
+      ggplot(.SD,
+             aes(x =  m6Alvl, y = t12_from_decay(`WT`) )) +
+        ## correlation
+        #geom_smooth(method = "lm") +
+        #stat_cor(label.y = Inf, vjust = 1.3*2) +
+        #stat_poly_line( ) +
+        #stat_poly_eq() +
+        ## scatter
+        geom_point(aes(col = (exbin))) +
+        #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+        #geom_point(aes(y=t12_from_decay(`CTU2 KO`)), size = 2, col = palval_genotype[["CTU2 KO"]]) +
+        
+        
+        geom_text_repel(data = function(x){x[gs_name %in% gs_select, ]},
+                        aes(
+                          label = gsub(
+                            "HALLMARK_",
+                            "",
+                            gs_name
+                          )
+                          , col = exbin)
+                        #,  position = position_nudge_center(y = -0.1, center_y = 18)
+                        #, min.segment.length = 0
+                        , size = 3
+        ) +
+        
+
+        #stat_poly_line(aes(y= t12_from_decay(`CTU2 KO`)), col = palval_genotype[["CTU2 KO"]], se = FALSE, linetype = 2) +
+        scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+        ## style
+        coord_cartesian(ylim = c(3.8, 60)) +
+        scale_color_manual(values = palval_exbin ) +
+        theme_bw() +
+        theme(legend.position = "none") +
+        labs(x = expression(m^6*A~"level [A.U.]"),
+             y = "Half-life [h]"
+        ) +
+        
+        NULL
+  ]
+  
+ggsave(file.path(figDir, "hallmark_t12_m6A.pdf"), width = 3, height = 3)
+
+```
+
+```{r hallmark_t12_CTU2, fig.width = 3, fig.height = 4}
+
+plotdat <-
+  with(mcm5s2U_SLAM,
+       slam[
+         region == "exonic"
+       ][ 
+         , merge(.SD
+                 , exlenTabGene
+                 , "gene_id")
+       ][
+         , merge(.SD
+                 , msigDT[grepl("HALLMARK_", gs_name), .(gene, gs_name)]
+                 , "gene"
+                 , allow.cartesian = TRUE
+         )
+       ][
+         , .(Readcount = sum(Readcount)
+             , min2 = sum(min2)
+             , exlen = mean(exlen)
+         )
+         , by = .(run, region, gs_name)
+       ][
+         , NTR := min2/Readcount
+       ][
+         , merge(.SD, meta, "run")
+       ][
+         , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+       ][
+         , exbin := cut2(exlen, g = exlenbins)
+       ][
+         , {
+           fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+           coeff = summary(fit)$coefficients
+           data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+         }
+         , by = .(gs_name, region, exlen, exbin, genotype )
+       ][
+         , dcast(.SD, gs_name + region + exlen + exbin ~ genotype, value.var = "decay_rate")
+       ][
+         , merge(.SD
+                 , merge(
+                   glori$dt[, .(m6Alvl = sum(m6A_lvl)), by = .(gene = Gene)]
+                   , msigDT, "gene")[, .(m6Alvl = mean(m6Alvl, na.rm = TRUE)), by = .(gs_name)]
+                 
+                 , "gs_name"
+         )
+       ])
+
+pl.scatter <- 
+  plotdat[
+      ,
+      ggplot(.SD,
+             aes(x =  m6Alvl, y = t12_from_decay(`WT`), col = (exbin) )) +
+        ## correlation
+        #geom_smooth(method = "lm") +
+        #stat_cor(label.y = Inf, vjust = 1.3*2) +
+        ## scatter
+        geom_point(size = 0.75) +
+        #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+        #geom_point(aes(y=t12_from_decay(`CTU2 KO`)), size = 2, col = palval_genotype[["CTU2 KO"]]) +
+        
+        geom_segment(aes(xend = m6Alvl, y = t12_from_decay(`WT`), yend = t12_from_decay(`CTU2 KO`)), arrow = arrow(length = unit(2, "mm")) ) +
+        
+        geom_text_repel(data = function(x){x[gs_name %in% gs_select, ]},
+                        aes(
+                          label = gsub(
+                            "HALLMARK_",
+                            "",
+                            gs_name
+                          )
+                          , col = exbin)
+                        #,  position = position_nudge_center(y = -0.1, center_y = 18)
+                        #, min.segment.length = 0
+                        , size = 3
+        ) +
+        #stat_poly_line(aes(y= t12_from_decay(`WT`)), col = palval_genotype[["WT"]], se = FALSE, linetype = 2) +
+        #stat_poly_line(aes(y= t12_from_decay(`CTU2 KO`)), col = palval_genotype[["CTU2 KO"]], se = FALSE, linetype = 2) +
+        scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+        ## style
+        coord_cartesian(ylim = c(3.8, 60)) +
+        scale_color_manual(values = palval_exbin ) +
+        theme_bw() +
+        geom_label_npc(label = "CTU2 KO", npcx = 0.98, npcy = 0.98) +
+        theme(legend.position = "none") +
+        labs(x = expression(m^6*A~"level [A.U.]"),
+             y = "Half-life [h]"
+        ) +
+        
+        NULL
+      
+    ]
+
+pl.bar <-
+  plotdat[, ggplot(.SD,
+                     aes(x =  m6Alvl, y = log2(t12_from_decay(`CTU2 KO`) / t12_from_decay(`WT`)) )) +
+          ## bar
+          geom_point(aes(col = (exbin) , fill = (exbin))) +
+              
+              ## correlation
+              stat_poly_line() +
+              # stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "top", label.x = "right", parse = TRUE) +
+              
+              ## scatter
+              #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+              
+              
+              ## style
+              #coord_cartesian(ylim = c(6, 60)) +
+              scale_color_manual(values = palval_exbin ) +
+              scale_fill_manual(values = palval_exbin ) +
+              theme_bw() +
+              theme(legend.position = "none") +
+              labs(x = expression(m^6*A~"level [A.U.]"),
+                   y = expression(Log[2]*FC)
+              )]
+  
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            #theme(aspect.ratio=1) +
+            NULL
+          , 
+          pl.bar
+          , 
+          ncol = 1, align = "v", heights = c(2,1)
+          )
+
+ggsave(file.path(figDir, "hallmark_t12_CTU2.pdf"), width = 3, height = 4)
+
+```
+
+```{r hallmark_t12_ELP1, fig.width = 3, fig.height = 4}
+
+plotdat <-
+  with(mcm5s2U_SLAM,
+       slam[
+         region == "exonic"
+       ][ 
+         , merge(.SD
+                 , exlenTabGene
+                 , "gene_id")
+       ][
+         , merge(.SD
+                 , msigDT[grepl("HALLMARK_", gs_name), .(gene, gs_name)]
+                 , "gene"
+                 , allow.cartesian = TRUE
+         )
+       ][
+         , .(Readcount = sum(Readcount)
+             , min2 = sum(min2)
+             , exlen = mean(exlen)
+         )
+         , by = .(run, region, gs_name)
+       ][
+         , NTR := min2/Readcount
+       ][
+         , merge(.SD, meta, "run")
+       ][
+         , expression := ifelse(label_time_num == 0, 1, 1 - NTR)
+       ][
+         , exbin := cut2(exlen, g = exlenbins)
+       ][
+         , {
+           fit = lm(formula = log2(expression) ~ label_time_num, data = .SD)
+           coeff = summary(fit)$coefficients
+           data.table(decay_rate = -1 * coeff["label_time_num", "Estimate"] )
+         }
+         , by = .(gs_name, region, exlen, exbin, genotype )
+       ][
+         , dcast(.SD, gs_name + region + exlen + exbin ~ genotype, value.var = "decay_rate")
+       ][
+         , merge(.SD
+                 , merge(
+                   glori$dt[, .(m6Alvl = sum(m6A_lvl)), by = .(gene = Gene)]
+                   , msigDT, "gene")[, .(m6Alvl = mean(m6Alvl, na.rm = TRUE)), by = .(gs_name)]
+                 
+                 , "gs_name"
+         )
+       ])
+
+pl.scatter <- 
+  plotdat[
+      ,
+      ggplot(.SD,
+             aes(x =  m6Alvl, y = t12_from_decay(`WT`), col = (exbin) )) +
+        ## correlation
+        #geom_smooth(method = "lm") +
+        #stat_cor(label.y = Inf, vjust = 1.3*2) +
+        ## scatter
+        geom_point(size = 0.75) +
+        #geom_point(aes(y=t12_from_decay(`WT`)), size = 2, col = palval_genotype[["WT"]]) +
+        #geom_point(aes(y=t12_from_decay(`ELP1 KO`)), size = 2, col = palval_genotype[["ELP1 KO"]]) +
+        
+        geom_segment(aes(xend = m6Alvl, y = t12_from_decay(`WT`), yend = t12_from_decay(`ELP1 KO`)), arrow = arrow(length = unit(2, "mm")) ) +
+        
+        geom_text_repel(data = function(x){x[gs_name %in% gs_select, ]},
+                        aes(
+                          label = gsub(
+                            "HALLMARK_",
+                            "",
+                            gs_name
+                          )
+                          , col = exbin)
+                        #,  position = position_nudge_center(y = -0.1, center_y = 18)
+                        #, min.segment.length = 0
+                        , size = 3
+        ) +
+        #stat_poly_line(aes(y= t12_from_decay(`WT`)), col = palval_genotype[["WT"]], se = FALSE, linetype = 2) +
+        #stat_poly_line(aes(y= t12_from_decay(`ELP1 KO`)), col = palval_genotype[["ELP1 KO"]], se = FALSE, linetype = 2) +
+        scale_y_continuous(trans = "log10", breaks = c(6, 12, 24, 48), expand = expansion(c(0,0)), minor_breaks = seq(0, 96, 2) )  +
+        ## style
+        coord_cartesian(ylim = c(3.8, 60)) +
+        scale_color_manual(values = palval_exbin ) +
+        theme_bw() +
+        geom_label_npc(label = "ELP1 KO", npcx = 0.98, npcy = 0.98) +
+        theme(legend.position = "none") +
+        labs(x = expression(m^6*A~"level [A.U.]"),
+             y = "Half-life [h]"
+        ) +
+        
+        NULL
+      
+    ]
+
+pl.bar <-
+  plotdat[, ggplot(.SD,
+                     aes(x =  m6Alvl, y = log2(t12_from_decay(`ELP1 KO`) / t12_from_decay(`WT`)) )) +
+          ## bar
+          geom_point(aes(col = (exbin) , fill = (exbin))) +
+              
+              ## correlation
+              stat_poly_line() +
+              # stat_poly_eq(use_label("R2"), size = 4, coef.digits = 3, label.y = "top", label.x = "right", parse = TRUE) +
+              
+              ## scatter
+              #geom_point(aes(col = (gloribin) , fill = (gloribin)), size = 0.75) +
+              
+              
+              ## style
+              #coord_cartesian(ylim = c(6, 60)) +
+              scale_color_manual(values = palval_exbin ) +
+              scale_fill_manual(values = palval_exbin ) +
+              theme_bw() +
+              theme(legend.position = "none") +
+              labs(x = expression(m^6*A~"level [A.U.]"),
+                   y = expression(Log[2]*FC)
+              )]
+  
+
+
+ggarrange(pl.scatter +
+            theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.ticks.x = element_blank()) +
+            #theme(aspect.ratio=1) +
+            NULL
+          , 
+          pl.bar
+          , 
+          ncol = 1, align = "v", heights = c(2,1)
+          )
+
+ggsave(file.path(figDir, "hallmark_t12_ELP1.pdf"), width = 3, height = 4)
+
+```
+
+## STM mcm5s2U
+
+### GLORI bin
+
+```{r, fig.width = 6, fig.height = 3}
+
+as.data.table(drach.tx)[
+  , ensembl_transcript_id := gsub("\\..*$", "", seqnames)
+][
+  , merge(.SD, canonical_transcripts, "ensembl_transcript_id")
+][
+  , .(glori_m6A_lvl = sum(glori_m6A_lvl))
+  , by = .(ensembl_gene_id, region)
+][
+  glori_m6A_lvl < 15
+][
+  , gloribin := cut2(glori_m6A_lvl, cuts = seq(0, 20, 1), levels.mean = TRUE)
+  #, by = .(region)
+][
+  , merge(.SD, mcm5s2U_STM$log2FC_STM, "ensembl_gene_id", allow.cartesian = TRUE )
+][
+  ,
+  # normalize to stable genes
+  {
+    norm_fact = .SD[gloribin %in% levels(gloribin)[1] , .(nf = median(log2FC, na.rm = TRUE)), by = .(region, time)]
+    merge(.SD, norm_fact, by = c("region", "time"))[,  log2FC := log2FC - nf ][, !"nf"][]
+  }
+][
+  time == "0h" & !region == "utr5"
+][
+  , region2 := factor(sedit(as.character(region), c("cds", "utr3"), c("CDS~m^6*A", "'3UTR'~m^6*A") ), levels = c("CDS~m^6*A", "'3UTR'~m^6*A"))
+][
+  , 
+  
+    ggplot(.SD, aes(x = as.numeric(as.character(gloribin)), y = log2FC, col = genotype )) +
+    stat_summary(aes(col = genotype), fun.data = mean_se) +
+    stat_poly_line() +
+    #stat_poly_eq(use_label("eq", "R2"), size = 4, vstep = 0.075, coef.digits = 1) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    facet_nested(~ region2, labeller = label_parsed ) +
+    scale_color_manual(values = palval_genotype ) +
+    theme_bw() +
+    theme(legend.position =  "none") +
+          labs(x = expression("mRNA"~ m^6*A~"level"),
+           y = expression("log"[2]*"FC (+/-STM)")
+      ) +
+    NULL
+  
+]
+
+ggsave(file.path(figDir, "gloribin_mcm5s2U_STM.pdf"), width = 6, height = 3)
+
+```
+
+## Queuosine
+
+```{r queuosine_GLORI, fig.width = 4, fig.height = 3}
+
+as.data.table(cods.gr)[
+  codon %in% c("GAC", "AAC")
+][
+  , ensembl_transcript_id := gsub("\\..*", "", seqnames)
+][
+  ## we only look at genes with coverage in all datasets
+  ensembl_transcript_id %in%  Reduce(intersect, queuosine_riboseq$coverage_genes) 
+][
+  , melt(.SD, id.vars=c("codon", "gloribin", "glori_m6A_lvl"), measure.vars = queuosine_riboseq$meta$run, variable.name = "run", value.name = "occupancy")
+][
+  , c(setNames(as.list(mean_se(occupancy)), c("occupancy", "occ_min", "occ_max")), N = .N, glori_m6A_lvl = mean(glori_m6A_lvl))
+  , by = .(gloribin, codon, run)
+][
+  , c("experiment", "genotype", "replicate")  := setkeyv(queuosine_riboseq$meta, "run")[run, .(experiment, genotype, replicate) ]
+][
+  
+][
+  , ggplot(.SD, aes(x = glori_m6A_lvl, y = occupancy, col = genotype)) +
+    stat_summary(fun.data = mean_se) +
+    stat_poly_line(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ], se = FALSE ) +
+    stat_poly_eq(data = function(x)x[!gloribin %in% levels(gloribin)[c(length(levels(gloribin)))]  ],
+                 aes(label = after_stat(
+                   ifelse(
+                     r.squared < 0.1,
+                     paste0(
+                       "m~`=`~", round(b_1, 2)
+                       #, "*`,`~italic(R)^2<0.01"
+                     )
+                     ,
+                     paste0(
+                       "m~`=`~", round(b_1, 2)
+                       #, "*`,`~italic(R)^2~`=`~", round(r.squared, 2)
+                     ))
+                 )),
+                 output.type = "numeric",
+                 parse = TRUE,
+                 vstep = 0.1
+    ) +
+    scale_color_manual(values = palval_queosine ) +
+    facet_nested( ~ codon ) +
+    
+    theme_bw() +
+    labs(x = expression("Codon"~ m^6*A~"stoichiometry"), y="A-site occupancy") +
+    theme(legend.position =  "none") +
+    #scale_x_continuous(limits = c(0,1)) +
+    #geom_vline(aes(xintercept = 0.05), linetype = 2) +
+    NULL
+]
+
+ggsave(file.path(figDir, "queuosine_GLORI.pdf"), width = 4, height = 3)
+
+```

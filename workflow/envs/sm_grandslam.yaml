@@ -1,0 +1,8 @@
+name: sm_grandslam
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - hcc
+dependencies:
+  - openjdk=8
